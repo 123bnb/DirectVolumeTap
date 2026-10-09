@@ -531,9 +531,9 @@ static void SetSystemVolume(float v) {
     }
 }
 
-static const float kResetVolume = 0.3f;
+static const float kResetVolume = 0.1f;   // 复位目标音量（改为 0.1）
 static const float kBoundHigh = 0.85f;
-static const float kBoundLow  = 0.15f;
+static const float kBoundLow  = 0.05f;    // 触底阈值须低于复位目标0.1，避免复位后仍被判触底反复复位
 static BOOL VolumeNeedsReset(float v) { return (v > kBoundHigh || v < kBoundLow); }
 
 static void DoReset(float oldVol, float nowVol) {
