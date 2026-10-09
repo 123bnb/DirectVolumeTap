@@ -1,7 +1,11 @@
 // DirectVolumeTap — 独立版（自包含，注入即生效）
 // 不依赖任何设置页/配置：把 dylib 注入哪个 App，就在哪个 App 生效。
-//   ① 三指长按 → 弹出设置覆盖层，点选/替换「音量+」「音量-」两个点击坐标
-//      （红点=音量+点的地方，绿点=音量-点的地方；默认屏幕中心上+=红、下-=绿）
+//   ① 三指长按 → 弹出「菜单」：
+//        - 音量键设置（可点进去）：出现一红一绿两个大圆点，可自由拖动，
+//          上方绿点 = 音量键 + 的点击位置，下方红点 = 音量键 - 的点击位置；
+//          底部有「保存」「复位」两个按钮（保存记录坐标并关闭；复位回到初始位置）。
+//        - 调试开关（纯开关）：默认关闭。打开后，按物理音量键触发的点击
+//          会在点击位置显示对应颜色的大圆点轨迹；关闭则点击完全隐形。
 //   ② 触发：音量键（物理/蓝牙翻页器）→ KVO outputVolume（需激活静音音频会话）
 //   ③ 点击：PTFakeMetaTouch 原生库（fakeTouchId:AtPoint:withTouchPhase:），王跳跳同款
 //   ④ 复位：到顶/底自动拉回中间 0.3，防止按键失效
@@ -44,22 +48,37 @@ static NSUserDefaults *Defaults(void) {
     return d;
 }
 
+// 调试开关默认关闭；打开时按音量键点击会显示轨迹标注
+static BOOL DebugEnabled(void) {
+    return [[Defaults() objectForKey:@"debugEnabled"] boolValue];
+}
+
 // =====================================================
-// AutoSkipSettingsCenter（三指设置界面 + 点选坐标）
+// AutoSkipSettingsCenter（三指菜单 + 音量键设置子界面 + 调试开关）
 // =====================================================
-@interface AutoSkipSettingsCenter : NSObject
-@property (nonatomic, strong) UIView *overlay;
-@property (nonatomic, strong) UILabel *statusTip;
-@property (nonatomic, strong) NSMutableArray<NSValue *> *points; // CGPoint，[0]=音量+红，[1]=音量-绿
+@interface AutoSkipSettingsCenter : NSObject <UIGestureRecognizerDelegate>
+@property (nonatomic, strong) UIView *menuView;        // 三指长按弹出的菜单
+@property (nonatomic, strong) UIView *overlay;          // 音量键设置子界面覆盖层
+@property (nonatomic, strong) UISwitch *debugSwitch;    // 调试开关
+@property (nonatomic, strong) NSMutableArray<NSValue *> *points;  // [0]=音量+(绿,上) [1]=音量-(红,下)
+@property (nonatomic, strong) NSMutableArray<UIView *> *dotViews; // 与 points 对应的圆点视图
 + (instancetype)shared;
 - (void)installGestureInWindow:(UIWindow *)window;
 - (void)onThreeFingerTap:(UIGestureRecognizer *)gr;
-- (void)showOverlayInWindow:(UIWindow *)window;
-- (void)onOverlayTapToPick:(UITapGestureRecognizer *)gr;
-- (void)refreshMarkersInWindow:(UIWindow *)window;
-- (void)btnAddPoint;
-- (void)btnDelLast;
-- (void)btnClose;
+- (void)showMenuInWindow:(UIWindow *)window;
+- (void)closeMenu;
+- (void)openVolumeSettings;
+- (void)closeVolumeSettings;
+- (void)resetPoints;
+- (void)refreshMarkers;
+- (void)loadPoints;
+- (void)savePoints;
+- (void)onDotPan:(UIPanGestureRecognizer *)pan;
+- (void)onDebugSwitchChanged:(UISwitch *)sw;
++ (BOOL)isDebugEnabled;
++ (CGPoint)pointForPlus;
++ (CGPoint)pointForMinus;
++ (void)showDebugMarkerAtPoint:(CGPoint)p isPlus:(BOOL)isPlus;
 @end
 
 @implementation AutoSkipSettingsCenter
@@ -71,7 +90,7 @@ static NSUserDefaults *Defaults(void) {
     return s;
 }
 
-// 载入坐标；若无保存则用默认 = 屏幕中心上+=红、下-=绿
+// 载入坐标；若无保存则用默认 = 屏幕中心：上方绿+=、下方红-=
 - (void)loadPoints {
     self.points = [NSMutableArray array];
     NSDictionary *d = [Defaults() dictionaryRepresentation];
@@ -82,10 +101,10 @@ static NSUserDefaults *Defaults(void) {
         [self.points addObject:[NSValue valueWithCGPoint:CGPointMake([d[@"xMinus"] intValue], [d[@"yMinus"] intValue])]];
     }
     if (self.points.count == 0) {
-        // 默认：屏幕中心上下两段
         CGSize scr = [UIScreen mainScreen].bounds.size;
         if (scr.width > 0 && scr.height > 0) {
             CGFloat cx = scr.width / 2;
+            // 上方绿点 = 音量+ ；下方红点 = 音量-
             [self.points addObject:[NSValue valueWithCGPoint:CGPointMake(cx, scr.height * 0.30)]];
             [self.points addObject:[NSValue valueWithCGPoint:CGPointMake(cx, scr.height * 0.70)]];
             LogDVT(@"未保存坐标，使用默认: +=(%.0f,%.0f) -=(%.0f,%.0f)",
@@ -100,7 +119,7 @@ static NSUserDefaults *Defaults(void) {
     }
 }
 
-// 保存（points[0]→+, points[1]→-）
+// 保存（points[0]=音量+绿，points[1]=音量-红）
 - (void)savePoints {
     NSUserDefaults *d = Defaults();
     if (self.points.count > 0) {
@@ -117,146 +136,7 @@ static NSUserDefaults *Defaults(void) {
     LogDVT(@"已保存坐标 %lu 个点", (unsigned long)self.points.count);
 }
 
-// 三指手势回调：显示设置覆盖层
-- (void)onThreeFingerTap:(UIGestureRecognizer *)gr {
-    if (gr.state != UIGestureRecognizerStateBegan) return;
-    UIWindow *w = gr.view.window ?: [UIApplication sharedApplication].keyWindow;
-    LogDVT(@"三指手势触发 → 显示设置界面");
-    [self showOverlayInWindow:w];
-}
-
-// 显示设置覆盖层
-- (void)showOverlayInWindow:(UIWindow *)window {
-    if (!window) { LogDVT(@"覆盖层失败: 无窗口"); return; }
-    if (self.overlay) [self.overlay removeFromSuperview];
-
-    UIView *ov = [[UIView alloc] initWithFrame:window.bounds];
-    ov.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.35];
-    ov.userInteractionEnabled = YES;
-    self.overlay = ov;
-
-    // 顶部提示条
-    UILabel *tip = [[UILabel alloc] initWithFrame:CGRectMake(0, 100, window.bounds.size.width, 44)];
-    tip.text = @"点屏幕: 第1个=红+ 第2个=绿- | 已满则就近替换 | 右上角完成";
-    tip.textColor = [UIColor whiteColor];
-    tip.textAlignment = NSTextAlignmentCenter;
-    tip.backgroundColor = [[UIColor darkGrayColor] colorWithAlphaComponent:0.85];
-    tip.font = [UIFont boldSystemFontOfSize:15];
-    self.statusTip = tip;
-    [ov addSubview:tip];
-
-    // 完成按钮
-    UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem];
-    close.frame = CGRectMake(window.bounds.size.width - 90, 40, 80, 40);
-    [close setTitle:@"完成" forState:UIControlStateNormal];
-    [close setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    close.backgroundColor = [UIColor systemBlueColor];
-    close.layer.cornerRadius = 8;
-    [close addTarget:self action:@selector(btnClose) forControlEvents:UIControlEventTouchUpInside];
-    [ov addSubview:close];
-
-    // 删除最后一个点
-    UIButton *del = [UIButton buttonWithType:UIButtonTypeSystem];
-    del.frame = CGRectMake(16, window.bounds.size.height - 80, 110, 44);
-    [del setTitle:@"删除最后一点" forState:UIControlStateNormal];
-    [del setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    del.backgroundColor = [UIColor systemRedColor];
-    del.layer.cornerRadius = 8;
-    [del addTarget:self action:@selector(btnDelLast) forControlEvents:UIControlEventTouchUpInside];
-    [ov addSubview:del];
-
-    // 点选手势
-    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
-                                   initWithTarget:self action:@selector(onOverlayTapToPick:)];
-    [ov addGestureRecognizer:tap];
-
-    [window addSubview:ov];
-    [self refreshMarkersInWindow:window];
-    LogDVT(@"设置界面已显示");
-}
-
-// 覆盖层点选 → 记录坐标（最多2点，已满就近替换）
-- (void)onOverlayTapToPick:(UITapGestureRecognizer *)gr {
-    if (gr.state != UIGestureRecognizerStateEnded) return;
-    UIView *ov = gr.view;
-    if (!ov) return;
-    CGPoint loc = [gr locationInView:ov];
-    if (self.points.count < 2) {
-        [self.points addObject:[NSValue valueWithCGPoint:loc]];
-    } else {
-        CGFloat dP = hypot(loc.x - self.points[0].CGPointValue.x, loc.y - self.points[0].CGPointValue.y);
-        CGFloat dM = hypot(loc.x - self.points[1].CGPointValue.x, loc.y - self.points[1].CGPointValue.y);
-        NSUInteger idx = (dP <= dM) ? 0 : 1;
-        self.points[idx] = [NSValue valueWithCGPoint:loc];
-    }
-    LogDVT(@"★设置坐标: +=(%.0f,%.0f) -=(%.0f,%.0f)",
-           self.points.count>0 ? self.points[0].CGPointValue.x : -1,
-           self.points.count>0 ? self.points[0].CGPointValue.y : -1,
-           self.points.count>1 ? self.points[1].CGPointValue.x : -1,
-           self.points.count>1 ? self.points[1].CGPointValue.y : -1);
-    [self savePoints];
-    [self refreshMarkersInWindow:ov.window ?: [UIApplication sharedApplication].keyWindow];
-    self.statusTip.text = [NSString stringWithFormat:@"红+ :(%.0f,%.0f)  绿- :(%.0f,%.0f) | 右上角完成",
-                           self.points.count>0 ? self.points[0].CGPointValue.x : 0,
-                           self.points.count>0 ? self.points[0].CGPointValue.y : 0,
-                           self.points.count>1 ? self.points[1].CGPointValue.x : 0,
-                           self.points.count>1 ? self.points[1].CGPointValue.y : 0];
-}
-
-// 添加一个点（预留接口：覆盖层中心）
-- (void)btnAddPoint {
-    UIView *ov = self.overlay;
-    if (!ov) return;
-    CGPoint loc = CGPointMake(ov.bounds.size.width/2, ov.bounds.size.height/2);
-    if (self.points.count < 2) {
-        [self.points addObject:[NSValue valueWithCGPoint:loc]];
-    } else {
-        self.points[0] = [NSValue valueWithCGPoint:loc];
-    }
-    [self savePoints];
-    [self refreshMarkersInWindow:ov.window ?: [UIApplication sharedApplication].keyWindow];
-}
-
-// 删除最后一个点
-- (void)btnDelLast {
-    if (self.points.count) {
-        [self.points removeLastObject];
-        [self savePoints];
-        [self refreshMarkersInWindow:self.overlay.window];
-    }
-}
-
-// 关闭设置界面
-- (void)btnClose {
-    [self.overlay removeFromSuperview];
-    self.overlay = nil;
-    LogDVT(@"设置界面已关闭，当前 %lu 个坐标生效", (unsigned long)self.points.count);
-}
-
-// 画标记点：第0点=红+，第1点=绿-
-- (void)refreshMarkersInWindow:(UIWindow *)window {
-    if (!window || !self.overlay) return;
-    for (UIView *v in [self.overlay subviews]) if (v.tag == 999) [v removeFromSuperview];
-    for (NSUInteger i = 0; i < self.points.count; i++) {
-        CGPoint p = self.points[i].CGPointValue;
-        BOOL isPlus = (i == 0);
-        UILabel *dot = [[UILabel alloc] initWithFrame:CGRectMake(p.x - 22, p.y - 22, 44, 44)];
-        dot.tag = 999;
-        dot.layer.cornerRadius = 22;
-        dot.layer.masksToBounds = YES;
-        dot.layer.borderWidth = 3;
-        dot.layer.borderColor = [UIColor whiteColor].CGColor;
-        dot.backgroundColor = isPlus ? [UIColor systemRedColor] : [UIColor systemGreenColor];
-        dot.text = isPlus ? @"+" : @"-";
-        dot.textColor = [UIColor whiteColor];
-        dot.textAlignment = NSTextAlignmentCenter;
-        dot.font = [UIFont boldSystemFontOfSize:22];
-        [self.overlay addSubview:dot];
-        [self.overlay bringSubviewToFront:dot];
-    }
-}
-
-// 安装三指长按手势
+// ---------- 三指长按 → 菜单 ----------
 - (void)installGestureInWindow:(UIWindow *)window {
     if (!window) return;
     UILongPressGestureRecognizer *gr = [[UILongPressGestureRecognizer alloc]
@@ -265,6 +145,281 @@ static NSUserDefaults *Defaults(void) {
     gr.minimumPressDuration = 0.5;
     [window addGestureRecognizer:gr];
     LogDVT(@"三指长按手势已安装");
+}
+
+- (void)onThreeFingerTap:(UIGestureRecognizer *)gr {
+    if (gr.state != UIGestureRecognizerStateBegan) return;
+    UIWindow *w = gr.view.window ?: [UIApplication sharedApplication].keyWindow;
+    LogDVT(@"三指手势触发 → 显示菜单");
+    [self showMenuInWindow:w];
+}
+
+- (void)showMenuInWindow:(UIWindow *)window {
+    if (!window) { LogDVT(@"菜单失败: 无窗口"); return; }
+    [self closeMenu];
+    [self closeVolumeSettings];
+
+    UIView *mv = [[UIView alloc] initWithFrame:window.bounds];
+    mv.userInteractionEnabled = YES;
+    self.menuView = mv;
+
+    // 点空白处关闭菜单（面板内/控件上的触摸交给控件自身，不触发关闭）
+    UITapGestureRecognizer *bg = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(closeMenu)];
+    bg.delegate = self;
+    [mv addGestureRecognizer:bg];
+
+    // 菜单面板
+    CGFloat pw = MIN(window.bounds.size.width - 40, 320);
+    CGFloat ph = 230;
+    UIView *panel = [[UIView alloc] initWithFrame:CGRectMake((window.bounds.size.width - pw)/2,
+                                                             (window.bounds.size.height - ph)/2,
+                                                             pw, ph)];
+    panel.backgroundColor = [UIColor whiteColor];
+    panel.layer.cornerRadius = 14;
+    panel.layer.shadowColor = [UIColor blackColor].CGColor;
+    panel.layer.shadowOpacity = 0.3;
+    panel.layer.shadowOffset = CGSizeMake(0, 2);
+    panel.layer.shadowRadius = 6;
+    [mv addSubview:panel];
+
+    // 标题
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(0, 18, pw, 28)];
+    title.text = @"设置";
+    title.textColor = [UIColor darkGrayColor];
+    title.textAlignment = NSTextAlignmentCenter;
+    title.font = [UIFont boldSystemFontOfSize:17];
+    [panel addSubview:title];
+
+    // 左上角关闭按钮（关闭插件菜单）
+    UIButton *closeTL = [UIButton buttonWithType:UIButtonTypeSystem];
+    closeTL.frame = CGRectMake(10, 10, 56, 32);
+    [closeTL setTitle:@"关闭" forState:UIControlStateNormal];
+    [closeTL setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    closeTL.backgroundColor = [UIColor systemGrayColor];
+    closeTL.layer.cornerRadius = 8;
+    closeTL.titleLabel.font = [UIFont systemFontOfSize:14];
+    [closeTL addTarget:self action:@selector(closeMenu) forControlEvents:UIControlEventTouchUpInside];
+    [panel addSubview:closeTL];
+
+    // 「音量键设置」入口
+    UIButton *vol = [UIButton buttonWithType:UIButtonTypeSystem];
+    vol.frame = CGRectMake(16, 58, pw - 32, 48);
+    [vol setTitle:@"音量键设置" forState:UIControlStateNormal];
+    [vol setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    vol.backgroundColor = [UIColor systemBlueColor];
+    vol.layer.cornerRadius = 10;
+    [vol addTarget:self action:@selector(openVolumeSettings) forControlEvents:UIControlEventTouchUpInside];
+    [panel addSubview:vol];
+
+    // 调试开关行
+    UIView *dbgRow = [[UIView alloc] initWithFrame:CGRectMake(16, 118, pw - 32, 46)];
+    dbgRow.layer.cornerRadius = 10;
+    dbgRow.backgroundColor = [UIColor colorWithWhite:0.93 alpha:1];
+    [panel addSubview:dbgRow];
+    UILabel *dbgLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 0, pw - 120, 46)];
+    dbgLabel.text = @"调试开关";
+    dbgLabel.textColor = [UIColor darkGrayColor];
+    dbgLabel.font = [UIFont systemFontOfSize:16];
+    [dbgRow addSubview:dbgLabel];
+    self.debugSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(pw - 32 - 62, 7, 51, 31)];
+    self.debugSwitch.on = DebugEnabled();
+    [self.debugSwitch addTarget:self action:@selector(onDebugSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+    [dbgRow addSubview:self.debugSwitch];
+
+    [window addSubview:mv];
+    LogDVT(@"菜单已显示");
+}
+
+- (void)closeMenu {
+    if (self.menuView) { [self.menuView removeFromSuperview]; self.menuView = nil; }
+}
+
+// 背景手势只响应直接点在 menuView 空白上的触摸（面板/按钮/开关上的触摸不关闭菜单）
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gr shouldReceiveTouch:(UITouch *)touch {
+    if (gr.view == self.menuView && touch.view == self.menuView) return YES;
+    return NO;
+}
+
+// ---------- 音量键设置子界面 ----------
+- (void)openVolumeSettings {
+    [self closeMenu];
+    UIWindow *window = [UIApplication sharedApplication].keyWindow;
+    if (!window) { LogDVT(@"设置失败: 无 keyWindow"); return; }
+
+    UIView *ov = [[UIView alloc] initWithFrame:window.bounds];
+    ov.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.4];
+    ov.userInteractionEnabled = YES;
+    self.overlay = ov;
+    [window addSubview:ov];
+
+    // 顶部提示条
+    UILabel *tip = [[UILabel alloc] initWithFrame:CGRectMake(0, 100, window.bounds.size.width, 44)];
+    tip.text = @"拖动圆点设定「音量+ / 音量-」点击位置";
+    tip.textColor = [UIColor whiteColor];
+    tip.textAlignment = NSTextAlignmentCenter;
+    tip.backgroundColor = [[UIColor darkGrayColor] colorWithAlphaComponent:0.85];
+    tip.font = [UIFont boldSystemFontOfSize:15];
+    [ov addSubview:tip];
+
+    // 复位（左） / 保存（右）
+    UIButton *reset = [UIButton buttonWithType:UIButtonTypeSystem];
+    reset.frame = CGRectMake(20, window.bounds.size.height - 90, 120, 48);
+    [reset setTitle:@"复位" forState:UIControlStateNormal];
+    [reset setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    reset.backgroundColor = [UIColor systemOrangeColor];
+    reset.layer.cornerRadius = 10;
+    [reset addTarget:self action:@selector(resetPoints) forControlEvents:UIControlEventTouchUpInside];
+    [ov addSubview:reset];
+
+    UIButton *save = [UIButton buttonWithType:UIButtonTypeSystem];
+    save.frame = CGRectMake(window.bounds.size.width - 150, window.bounds.size.height - 90, 130, 48);
+    [save setTitle:@"保存" forState:UIControlStateNormal];
+    [save setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    save.backgroundColor = [UIColor systemGreenColor];
+    save.layer.cornerRadius = 10;
+    [save addTarget:self action:@selector(onSave) forControlEvents:UIControlEventTouchUpInside];
+    [ov addSubview:save];
+
+    [self refreshMarkers];
+    LogDVT(@"音量键设置子界面已显示");
+}
+
+- (void)onSave {
+    [self savePoints];
+    [self closeVolumeSettings];
+    // 保存后回到菜单，方便继续调调试开关或退出
+    [self showMenuInWindow:[UIApplication sharedApplication].keyWindow];
+}
+
+- (void)closeVolumeSettings {
+    if (self.overlay) { [self.overlay removeFromSuperview]; self.overlay = nil; }
+    [self.dotViews removeAllObjects];
+}
+
+// 复位：圆点回到初始位置（屏幕上下中心），不关闭界面、不保存
+- (void)resetPoints {
+    CGSize scr = [UIScreen mainScreen].bounds.size;
+    CGFloat cx = scr.width / 2;
+    if (self.points.count >= 2) {
+        self.points[0] = [NSValue valueWithCGPoint:CGPointMake(cx, scr.height * 0.30)];
+        self.points[1] = [NSValue valueWithCGPoint:CGPointMake(cx, scr.height * 0.70)];
+    }
+    [self refreshMarkers];
+    LogDVT(@"已复位圆点到初始位置");
+}
+
+// 画大圆点：index0=绿+（上） index1=红-（下），可拖动
+- (void)refreshMarkers {
+    if (!self.overlay) return;
+    for (UIView *v in self.dotViews) [v removeFromSuperview];
+    self.dotViews = [NSMutableArray array];
+
+    if (!self.points) [self loadPoints];
+    for (NSUInteger i = 0; i < self.points.count; i++) {
+        CGPoint p = self.points[i].CGPointValue;
+        BOOL isPlus = (i == 0);
+        CGFloat d = 66.0;
+        UIView *dot = [[UIView alloc] initWithFrame:CGRectMake(p.x - d/2, p.y - d/2, d, d)];
+        dot.backgroundColor = isPlus ? [UIColor systemGreenColor] : [UIColor systemRedColor];
+        dot.layer.cornerRadius = d/2;
+        dot.layer.masksToBounds = YES;
+        dot.alpha = 0.85;
+        dot.layer.borderWidth = 3;
+        dot.layer.borderColor = [UIColor whiteColor].CGColor;
+
+        UILabel *lb = [[UILabel alloc] initWithFrame:dot.bounds];
+        lb.text = isPlus ? @"+" : @"-";
+        lb.textColor = [UIColor whiteColor];
+        lb.textAlignment = NSTextAlignmentCenter;
+        lb.font = [UIFont boldSystemFontOfSize:30];
+        [dot addSubview:lb];
+
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onDotPan:)];
+        [dot addGestureRecognizer:pan];
+
+        [self.overlay addSubview:dot];
+        [self.dotViews addObject:dot];
+        LogDVT(@"圆点%d 位于 (%.0f,%.0f)", (int)i, p.x, p.y);
+    }
+}
+
+// 拖动圆点 → 更新坐标
+- (void)onDotPan:(UIPanGestureRecognizer *)pan {
+    if (!pan.view) return;
+    NSUInteger idx = [self.dotViews indexOfObject:pan.view];
+    if (idx == NSNotFound || idx >= self.points.count) return;
+    if (pan.state == UIGestureRecognizerStateBegan || pan.state == UIGestureRecognizerStateChanged) {
+        CGPoint trans = [pan translationInView:self.overlay];
+        CGPoint center = pan.view.center;
+        CGPoint newCenter = CGPointMake(center.x + trans.x, center.y + trans.y);
+        pan.view.center = newCenter;
+        [pan setTranslation:CGPointZero inView:self.overlay];
+        self.points[idx] = [NSValue valueWithCGPoint:newCenter];
+    } else if (pan.state == UIGestureRecognizerStateEnded) {
+        LogDVT(@"圆点%d 最终位置 (%.0f,%.0f)", (int)idx, pan.view.center.x, pan.view.center.y);
+    }
+}
+
+// ---------- 调试开关 ----------
+- (void)onDebugSwitchChanged:(UISwitch *)sw {
+    NSUserDefaults *d = Defaults();
+    [d setBool:sw.on forKey:@"debugEnabled"];
+    [d synchronize];
+    LogDVT(@"调试开关 -> %@", sw.on ? @"开" : @"关");
+}
+
++ (BOOL)isDebugEnabled {
+    return DebugEnabled();
+}
+
+// ---------- 坐标访问（供触发模块读取） ----------
++ (CGPoint)pointForPlus {
+    AutoSkipSettingsCenter *c = [AutoSkipSettingsCenter shared];
+    if (c.points.count > 0) return c.points[0].CGPointValue;
+    return CGPointMake(NSNotFound, NSNotFound);
+}
++ (CGPoint)pointForMinus {
+    AutoSkipSettingsCenter *c = [AutoSkipSettingsCenter shared];
+    if (c.points.count > 1) return c.points[1].CGPointValue;
+    return CGPointMake(NSNotFound, NSNotFound);
+}
+
+// 调试轨迹：在点击位置显示对应颜色的大圆点，短暂停留后消失
++ (void)showDebugMarkerAtPoint:(CGPoint)p isPlus:(BOOL)isPlus {
+    UIWindow *w = nil;
+    UIApplication *app = [UIApplication sharedApplication];
+    if (app.connectedScenes) {
+        for (UIScene *scene in app.connectedScenes) {
+            if ([scene isKindOfClass:[UIWindowScene class]]) {
+                UIWindowScene *ws = (UIWindowScene *)scene;
+                if (ws.activationState != UISceneActivationStateForegroundActive) continue;
+                for (UIWindow *win in ws.windows) if (win.isKeyWindow) { w = win; break; }
+                if (!w) w = [ws.windows firstObject];
+                break;
+            }
+        }
+    }
+    if (!w) w = app.keyWindow;
+    if (!w) return;
+
+    CGFloat d = 66.0;
+    UIView *marker = [[UIView alloc] initWithFrame:CGRectMake(p.x - d/2, p.y - d/2, d, d)];
+    marker.backgroundColor = isPlus ? [UIColor systemGreenColor] : [UIColor systemRedColor];
+    marker.layer.cornerRadius = d/2;
+    marker.layer.masksToBounds = YES;
+    marker.alpha = 0.8;
+    marker.layer.borderWidth = 3;
+    marker.layer.borderColor = [UIColor whiteColor].CGColor;
+    UILabel *lb = [[UILabel alloc] initWithFrame:marker.bounds];
+    lb.text = isPlus ? @"+" : @"-";
+    lb.textColor = [UIColor whiteColor];
+    lb.textAlignment = NSTextAlignmentCenter;
+    lb.font = [UIFont boldSystemFontOfSize:30];
+    [marker addSubview:lb];
+    [w addSubview:marker];
+    [w bringSubviewToFront:marker];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ [marker removeFromSuperview]; });
 }
 
 @end
@@ -307,25 +462,25 @@ static void ShowToast(NSString *msg) {
                    dispatch_get_main_queue(), ^{ [l removeFromSuperview]; });
 }
 
-// 按方向点击：delta>0 点红+(音量+)，delta<0 点绿-(音量-)
+// 按方向点击：delta>0 点绿+(音量+)，delta<0 点红-(音量-)
 static void TapPoints(float delta) {
-    AutoSkipSettingsCenter *c = [AutoSkipSettingsCenter shared];
     BOOL isPlus = (delta > 0);
-    NSValue *target = isPlus ? (c.points.count > 0 ? c.points[0] : nil)
-                             : (c.points.count > 1 ? c.points[1] : nil);
-    if (!target) {
-        LogDVT(@"音量%@：无对应坐标（请三指长按设置）", isPlus ? @"+" : @"-");
+    CGPoint p = isPlus ? [AutoSkipSettingsCenter pointForPlus] : [AutoSkipSettingsCenter pointForMinus];
+    if (p.x == NSNotFound || p.y == NSNotFound) {
+        LogDVT(@"音量%@：无对应坐标（请三指长按→音量键设置）", isPlus ? @"+" : @"-");
         ShowToast([NSString stringWithFormat:@"音量%@ 未设坐标，三指长按设置", isPlus ? @"+" : @"-"]);
         return;
     }
-    CGPoint p = target.CGPointValue;
     UIWindow *w = FindKeyWindow();
     if (!w) { LogDVT(@"音量触发：无 keyWindow"); return; }
     NSInteger pid = [PTFakeMetaTouch fakeTouchId:1 AtPoint:p withTouchPhase:UITouchPhaseBegan];
     usleep(30000);
     [PTFakeMetaTouch fakeTouchId:pid AtPoint:p withTouchPhase:UITouchPhaseEnded];
     LogDVT(@"音量%@→点击 (%d, %d) pointId=%ld", isPlus ? @"+" : @"-", (int)p.x, (int)p.y, (long)pid);
-    ShowToast([NSString stringWithFormat:@"音量%@ 已点击 (%.0f,%.0f)", isPlus ? @"+" : @"-", p.x, p.y]);
+    // 调试开关打开时才显示点击轨迹；关闭则完全隐形
+    if ([AutoSkipSettingsCenter isDebugEnabled]) {
+        [AutoSkipSettingsCenter showDebugMarkerAtPoint:p isPlus:isPlus];
+    }
 }
 
 // 去抖 250ms
@@ -460,9 +615,6 @@ static void KeepAudioSessionActive(void) {
 // =====================================================
 // constructor：注入自启动（注入即生效，无勾选判断）
 // =====================================================
-// constructor 在 dyld 注入时机执行，此时 App 主线程/UIKit/Foundation 未就绪，
-// 任何 UIKit/Foundation 同步操作都会 SIGABRT。因此只 dispatch 到主队列，
-// 全部初始化等 App 启动后执行。
 static DirectVolumeObserver *gObs = nil;
 
 __attribute__((constructor))
@@ -473,7 +625,6 @@ static void DirectTapInit(void) {
             LogDVT(@"[DirectVolumeTap 已注入] 进程=%@ bundleID=%@",
                    NSProcessInfo.processInfo.processName,
                    [[NSBundle mainBundle] bundleIdentifier]);
-            // 注入即生效：直接激活监听 + 静音会话 + 三指手势
             gObs = [DirectVolumeObserver new];
             [[AVAudioSession sharedInstance] addObserver:gObs
                                               forKeyPath:@"outputVolume"
