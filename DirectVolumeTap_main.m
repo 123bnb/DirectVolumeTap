@@ -558,6 +558,13 @@ static void DoReset(float oldVol, float nowVol) {
     float old = oldN.floatValue, now = newN.floatValue;
     float delta = now - old;
     if (fabsf(delta) < 0.0005f) return;
+    // 插件复位副作用识别：旧值在边界外(触顶/触底)、新值≈复位目标0.3，
+    // 说明这是插件把音量拉回中间造成的，不是用户按键，不触发点击。
+    // 真实按键单次只变一小档，不可能从边界外一下跳到0.3，故不会误伤真实操作。
+    if (VolumeNeedsReset(old) && fabsf(now - kResetVolume) < 0.05f) {
+        LogDVT(@"复位副作用(%.2f→%.2f)，不触发点击", old, now);
+        return;
+    }
     LogDVT(@"音量%@ delta=%+.2f 当前=%0.2f → 触发", delta > 0 ? @"+" : @"-", delta, now);
     TapPointsDebounced(delta);
     DoReset(old, now);
