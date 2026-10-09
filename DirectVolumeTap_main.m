@@ -385,7 +385,13 @@ static BOOL DebugEnabled(void) {
 }
 
 // 调试轨迹：在点击位置显示对应颜色的大圆点，短暂停留后消失
+// 关键：marker 必须 userInteractionEnabled=NO（触摸穿透，不拦截下层 App 的点击，
+//       否则模拟触摸会点到自己身上导致无法连续点触）；并复用单个 marker，
+//       避免同位置多次点击叠加变实。
 + (void)showDebugMarkerAtPoint:(CGPoint)p isPlus:(BOOL)isPlus {
+    static UIView *gDebugMarker = nil;   // 复用一个 marker，防止叠加
+    if (gDebugMarker) { [gDebugMarker removeFromSuperview]; gDebugMarker = nil; }
+
     UIWindow *w = nil;
     UIApplication *app = [UIApplication sharedApplication];
     if (app.connectedScenes) {
@@ -410,16 +416,22 @@ static BOOL DebugEnabled(void) {
     marker.alpha = 0.8;
     marker.layer.borderWidth = 3;
     marker.layer.borderColor = [UIColor whiteColor].CGColor;
+    marker.userInteractionEnabled = NO;   // 触摸穿透，不拦截下层点击
     UILabel *lb = [[UILabel alloc] initWithFrame:marker.bounds];
     lb.text = isPlus ? @"+" : @"-";
     lb.textColor = [UIColor whiteColor];
     lb.textAlignment = NSTextAlignmentCenter;
     lb.font = [UIFont boldSystemFontOfSize:30];
     [marker addSubview:lb];
+    gDebugMarker = marker;
     [w addSubview:marker];
     [w bringSubviewToFront:marker];
+    UIView *keepAlive = marker;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ [marker removeFromSuperview]; });
+                   dispatch_get_main_queue(), ^{
+        [keepAlive removeFromSuperview];
+        if (gDebugMarker == keepAlive) gDebugMarker = nil;
+    });
 }
 
 @end
