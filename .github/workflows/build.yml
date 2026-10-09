@@ -1,33 +1,27 @@
 name: Build DirectVolumeTap
-
 on:
   push:
-    branches: [ main ]
-
+  workflow_dispatch:
 jobs:
   build:
     runs-on: macos-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Get iOS 16.5 SDK
         uses: actions/checkout@v4
         with:
           repository: theos/sdks
           sparse-checkout: iPhoneOS16.5.sdk
           path: sdks
-
       - name: Install ldid
         run: brew install ldid
-
       - name: Build & sign dylib (pure clang, PTFakeTouch native)
         run: |
           SDK="$GITHUB_WORKSPACE/sdks/iPhoneOS16.5.sdk"
           ls -d "$SDK" || echo "SDK 路径: $SDK"
           mkdir -p out
           SRCS="DirectVolumeTap_main.m ptftouch/PTFakeMetaTouch.m ptftouch/UITouch-KIFAdditions.m ptftouch/UIEvent+KIFAdditions.m ptftouch/IOHIDEvent+KIF.m"
-          # 先试 arm64+arm64e；arm64e 若失败则只 arm64
           clang -arch arm64 -arch arm64e -isysroot "$SDK" -miphoneos-version-min=15.0 \
             -fobjc-arc -fobjc-abi-version=2 \
             -Wl,-undefined,dynamic_lookup \
@@ -47,9 +41,8 @@ jobs:
                    && echo "编译 OK (仅arm64)"; }
           file out/DirectVolumeTap.dylib
           ldid -S out/DirectVolumeTap.dylib && echo "ldid 签名 OK"
-
       - name: Upload artifact (dylib)
         uses: actions/upload-artifact@v4
         with:
-          name: DirectVolumeTap-dylib
+          name: DirectVolumeTap-dylib-${{ github.ref_name }}
           path: out/DirectVolumeTap.dylib
