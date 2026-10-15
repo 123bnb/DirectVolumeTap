@@ -8,6 +8,8 @@ on:
 jobs:
   build:
     runs-on: macos-latest
+    permissions:
+      contents: write   # v1.0.1：允许 GITHUB_TOKEN 创建 Release（默认只读会导致发版步骤失败）
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -66,8 +68,10 @@ jobs:
 
       - name: Create Release (tag only)
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: out/DirectVolumeTap_${{ steps.ver.outputs.version }}.dylib
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            "out/DirectVolumeTap_${GITHUB_REF_NAME}.dylib" \
+            --title "DirectVolumeTap ${GITHUB_REF_NAME}" \
+            --notes "自动构建（clang + ldid 签名）。文件名带版本号，注入目标 App 后生效。"
