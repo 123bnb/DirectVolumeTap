@@ -1,4 +1,4 @@
-// DirectVolumeTap v1.0.1 — 独立版（自包含，注入即生效）
+// DirectVolumeTap v1.0.2 — 独立版（自包含，注入即生效）
 // 不依赖任何设置页/配置：把 dylib 注入哪个 App，就在哪个 App 生效。
 //   ① 三指长按 → 弹出「菜单」：
 //        - 音量键设置（可点进去）：出现一红一绿两个大圆点，可自由拖动，
@@ -667,46 +667,54 @@ static void ShowToast(NSString *msg) {
                    dispatch_get_main_queue(), ^{ [l removeFromSuperview]; });
 }
 
-// v1.0.1：滑动回放所用串行队列（避免阻塞主线程过久）
-static dispatch_queue_t gSwipeQueue(void) {
-    static dispatch_queue_t q; static dispatch_once_t once;
-    dispatch_once(&once, ^{ q = dispatch_queue_create("com.yourname.dvt.swipe", DISPATCH_QUEUE_SERIAL); });
-    return q;
-}
-
 // v1.0.1：读滑动轨迹点（NSArray<[x,y,t]>）
 static NSArray *LoadSwipePts(NSString *key) {
     NSArray *a = [Defaults() arrayForKey:key];
     return a ?: @[];
 }
 
-// v1.0.1：按录制时间戳逐点注入，完美复原真实滑动（抄袭 PageTurnerDylib 的 PTFakeRecSwipeAsync）
+// v1.0.1：按录制时间戳逐点注入，完美复原真实滑动。
+// 关键修复：fakeTouchId 是 UIKit 事件注入，必须在【主线程】调用。
+// 原实现把它丢到后台 gSwipeQueue 导致 UIKit/CoreAnimation 在后台线程断言陷阱（EXC_BREAKPOINT 闪退）。
+// 改为照搬 PageTurnerDylib 验证过的「主线程 dispatch_after 递归调度」：不阻塞主线程，且全程在主线程。
 static void DVTFakeSwipe(NSArray *pts, BOOL isPlus) {
     if (!pts || pts.count < 2) return;
-    NSInteger pid = 0;
-    CFAbsoluteTime startT = CFAbsoluteTimeGetCurrent();
-    for (NSUInteger i = 0; i < pts.count; i++) {
-        NSArray *p = pts[i];
-        if (p.count < 3) continue;
+    __block NSInteger pid = -1;
+    __block NSUInteger idx = 0;
+    __block void (^step)(void);
+    step = ^(void) {
+        if (idx >= pts.count) {
+            LogDVT(@"滑动模式回放 %@ 完成 点数=%lu", isPlus ? @"音量+" : @"音量-", (unsigned long)pts.count);
+            if ([AutoSkipSettingsCenter isDebugEnabled]) {
+                [AutoSkipSettingsCenter showDebugSwipeTrail:pts isPlus:isPlus];
+            }
+            return;
+        }
+        NSArray *p = pts[idx];
+        if (p.count < 3) { idx++; step(); return; }   // 跳过坏点
         float x = [p[0] floatValue], y = [p[1] floatValue];
         float t = [p[2] floatValue];   // 相对录制起点的毫秒
         CGPoint pt = CGPointMake(x, y);
-        if (i == 0) {
-            pid = [PTFakeMetaTouch fakeTouchId:1 AtPoint:pt withTouchPhase:UITouchPhaseBegan];
-        } else {
-            float elapsed = (CFAbsoluteTimeGetCurrent() - startT) * 1000.0f;
-            float wait = t - elapsed;
-            if (wait > 0.0f) usleep((useconds_t)(wait * 1000.0f));
-            UITouchPhase phase = (i == pts.count - 1) ? UITouchPhaseEnded : UITouchPhaseMoved;
-            [PTFakeMetaTouch fakeTouchId:pid AtPoint:pt withTouchPhase:phase];
+        UITouchPhase ph = (idx == 0) ? UITouchPhaseBegan
+                        : ((idx == pts.count - 1) ? UITouchPhaseEnded : UITouchPhaseMoved);
+        if (idx == 0) pid = [PTFakeMetaTouch fakeTouchId:1 AtPoint:pt withTouchPhase:ph];
+        else          [PTFakeMetaTouch fakeTouchId:pid AtPoint:pt withTouchPhase:ph];
+        idx++;
+        if (idx >= pts.count) {
+            LogDVT(@"滑动模式回放 %@ 完成 点数=%lu", isPlus ? @"音量+" : @"音量-", (unsigned long)pts.count);
+            if ([AutoSkipSettingsCenter isDebugEnabled]) {
+                [AutoSkipSettingsCenter showDebugSwipeTrail:pts isPlus:isPlus];
+            }
+            return;
         }
-    }
-    LogDVT(@"滑动模式回放 %@ 完成 点数=%lu", isPlus ? @"音量+" : @"音量-", (unsigned long)pts.count);
-    if ([AutoSkipSettingsCenter isDebugEnabled]) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [AutoSkipSettingsCenter showDebugSwipeTrail:pts isPlus:isPlus];
-        });
-    }
+        // 与下一点之间的等待（基于录制时间戳，最小 8ms 防风暴——PageTurnerDylib 同款）
+        NSArray *nxt = pts[idx];
+        float waitMs = (nxt.count >= 3) ? ([nxt[2] floatValue] - t) : 8.0f;
+        if (waitMs < 8.0f) waitMs = 8.0f;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(waitMs * NSEC_PER_SEC / 1000)),
+                       dispatch_get_main_queue(), step);
+    };
+    step();
 }
 
 // 按方向点击/滑动：delta>0 音量+，delta<0 音量-
@@ -720,7 +728,8 @@ static void TapPoints(float delta) {
             ShowToast([NSString stringWithFormat:@"滑动模式未录制%@轨迹", isPlus ? @"音量+" : @"音量-"]);
             return;
         }
-        dispatch_async(gSwipeQueue(), ^{ DVTFakeSwipe(pts, isPlus); });
+        // fakeTouchId 必须主线程：先切主队列，由 DVTFakeSwipe 内部递归 dispatch_after(main) 逐点回放
+        dispatch_async(dispatch_get_main_queue(), ^{ DVTFakeSwipe(pts, isPlus); });
         return;
     }
     // 点击模式（原逻辑不变）
@@ -732,14 +741,17 @@ static void TapPoints(float delta) {
     }
     UIWindow *w = FindKeyWindow();
     if (!w) { LogDVT(@"音量触发：无 keyWindow"); return; }
-    NSInteger pid = [PTFakeMetaTouch fakeTouchId:1 AtPoint:p withTouchPhase:UITouchPhaseBegan];
-    usleep(30000);
-    [PTFakeMetaTouch fakeTouchId:pid AtPoint:p withTouchPhase:UITouchPhaseEnded];
-    LogDVT(@"音量%@→点击 (%d, %d) pointId=%ld", isPlus ? @"+" : @"-", (int)p.x, (int)p.y, (long)pid);
-    // 调试开关打开时才显示点击轨迹；关闭则完全隐形
-    if ([AutoSkipSettingsCenter isDebugEnabled]) {
-        [AutoSkipSettingsCenter showDebugMarkerAtPoint:p isPlus:isPlus];
-    }
+    // 同样保证 fakeTouchId 在主线程（音量监听 KVO 可能在非主线程回调）
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSInteger pid = [PTFakeMetaTouch fakeTouchId:1 AtPoint:p withTouchPhase:UITouchPhaseBegan];
+        usleep(30000);
+        [PTFakeMetaTouch fakeTouchId:pid AtPoint:p withTouchPhase:UITouchPhaseEnded];
+        LogDVT(@"音量%@→点击 (%d, %d) pointId=%ld", isPlus ? @"+" : @"-", (int)p.x, (int)p.y, (long)pid);
+        // 调试开关打开时才显示点击轨迹；关闭则完全隐形
+        if ([AutoSkipSettingsCenter isDebugEnabled]) {
+            [AutoSkipSettingsCenter showDebugMarkerAtPoint:p isPlus:isPlus];
+        }
+    });
 }
 
 // 去抖 250ms
