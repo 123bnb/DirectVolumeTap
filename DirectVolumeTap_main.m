@@ -1,4 +1,4 @@
-// DirectVolumeTap v1.0.3 — 独立版（自包含，注入即生效）
+// DirectVolumeTap v1.0.4 — 独立版（自包含，注入即生效）
 // 不依赖任何设置页/配置：把 dylib 注入哪个 App，就在哪个 App 生效。
 //   ① 三指长按 → 弹出「菜单」：
 //        - 音量键设置（可点进去）：出现一红一绿两个大圆点，可自由拖动，
@@ -92,9 +92,10 @@ static BOOL DebugEnabled(void) {
 - (void)loadSwipes;
 - (void)drawSwipeTrails;
 - (void)drawPath:(NSArray *)pts color:(UIColor *)color alpha:(CGFloat)alpha;
-+ (void)dvtBeginTrail:(BOOL)isPlus;
-+ (void)dvtUpdateTrail:(NSArray *)pts upTo:(NSUInteger)count isPlus:(BOOL)isPlus;
++ (void)dvtBeginTrail:(BOOL)isPlus firstPoint:(CGPoint)first;
++ (void)dvtExtendTrailTo:(CGPoint)pt isPlus:(BOOL)isPlus;
 + (void)dvtEndTrail;
++ (void)showBusyHint;
 @property (nonatomic, strong) NSMutableArray *swipePlusPts;        // 音量+ 轨迹点(NSArray<[x,y,t]>)
 @property (nonatomic, strong) NSMutableArray *swipeMinusPts;       // 音量- 轨迹点
 @property (nonatomic, strong) NSMutableArray *currentRecording;
@@ -605,16 +606,16 @@ static BOOL DebugEnabled(void) {
     });
 }
 
-// v1.0.2：滑动回放轨迹可视化——抄袭 PageTurner deb 版的「逐点累积重绘 path」机制
-// 原 showDebugSwipeTrail 在回放【全部结束】后才画整条线 → 「滑完才闪现」；
-// 改为：回放每注入一点就实时延伸轨迹（对应 PT 的 PTRecTick / gRecTrailLayer 逐点更新 path）。
+// v1.0.4：滑动回放轨迹可视化——增量绘制（O(1) 每帧 append，消除旧版全量重建 O(n²) 对主线程的拖累）
 static CAShapeLayer *gDVTTrailLayer = nil;   // 回放轨迹层（复用，避免叠加）
+static CGMutablePathRef gDVTTrailPath = NULL;
 
-// 回放开始：创建轨迹层并挂到 keyWindow
-+ (void)dvtBeginTrail:(BOOL)isPlus {
+// 回放开始：创建轨迹层 + 可变路径，move 到第一点
++ (void)dvtBeginTrail:(BOOL)isPlus firstPoint:(CGPoint)first {
     UIWindow *w = FindKeyWindow();
     if (!w) return;
     if (gDVTTrailLayer) { [gDVTTrailLayer removeFromSuperlayer]; gDVTTrailLayer = nil; }
+    if (gDVTTrailPath)  { CGPathRelease(gDVTTrailPath); gDVTTrailPath = NULL; }
     CAShapeLayer *sl = [CAShapeLayer layer];
     sl.strokeColor = (isPlus ? [UIColor systemGreenColor] : [UIColor systemRedColor]).CGColor;
     sl.fillColor   = [UIColor clearColor].CGColor;
@@ -624,31 +625,52 @@ static CAShapeLayer *gDVTTrailLayer = nil;   // 回放轨迹层（复用，避�
     sl.opacity     = 0.9;
     [w.layer addSublayer:sl];
     gDVTTrailLayer = sl;
+    gDVTTrailPath  = CGPathCreateMutable();
+    CGPathMoveToPoint(gDVTTrailPath, NULL, first.x, first.y);
+    sl.path = gDVTTrailPath;
 }
 
-// 回放过程中：把已注入的前 count 个点重绘成路径（逐点延伸，对应 PTRecTick）
-+ (void)dvtUpdateTrail:(NSArray *)pts upTo:(NSUInteger)count isPlus:(BOOL)isPlus {
-    if (!gDVTTrailLayer || !pts || count == 0) return;
-    CGMutablePathRef path = CGPathCreateMutable();
-    BOOL first = YES;
-    for (NSUInteger i = 0; i < count && i < pts.count; i++) {
-        NSArray *p = pts[i];
-        if (p.count < 3) continue;
-        CGPoint pt = CGPointMake([p[0] floatValue], [p[1] floatValue]);
-        if (first) { CGPathMoveToPoint(path, NULL, pt.x, pt.y); first = NO; }
-        else       { CGPathAddLineToPoint(path, NULL, pt.x, pt.y); }
-    }
-    gDVTTrailLayer.path = path;
-    CGPathRelease(path);
+// 回放每帧：把当前插值点 append 到路径（增量，O(1)，不再全量重建）
++ (void)dvtExtendTrailTo:(CGPoint)pt isPlus:(BOOL)isPlus {
+    if (!gDVTTrailLayer || !gDVTTrailPath) return;
+    CGPathAddLineToPoint(gDVTTrailPath, NULL, pt.x, pt.y);
+    gDVTTrailLayer.path = gDVTTrailPath;
 }
 
-// 回放结束：延迟移除轨迹层
+// 回放结束：延迟移除轨迹层并释放路径
 + (void)dvtEndTrail {
     CAShapeLayer *sl = gDVTTrailLayer;
     gDVTTrailLayer = nil;
+    if (gDVTTrailPath) { CGPathRelease(gDVTTrailPath); gDVTTrailPath = NULL; }
     if (!sl) return;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ [sl removeFromSuperlayer]; });
+}
+
+// v1.0.4：防狂按提示——回放进行中再次触发音量键时，在屏幕顶部（灵动岛下方）浮现小字
+static UILabel *gBusyHint = nil;
++ (void)showBusyHint {
+    UIWindow *w = FindKeyWindow();
+    if (!w) return;
+    if (gBusyHint) { [gBusyHint removeFromSuperview]; gBusyHint = nil; }
+    CGFloat topInset = 0;
+    if (@available(iOS 11.0, *)) topInset = w.safeAreaInsets.top;
+    CGFloat y = topInset + 44;
+    UILabel *h = [[UILabel alloc] initWithFrame:CGRectMake(w.bounds.size.width/2 - 120, y, 240, 30)];
+    h.text = @"请等待滑动完成";
+    h.textColor = [UIColor whiteColor];
+    h.textAlignment = NSTextAlignmentCenter;
+    h.font = [UIFont systemFontOfSize:13];
+    h.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.65];
+    h.layer.cornerRadius = 15;
+    h.layer.masksToBounds = YES;
+    [w addSubview:h];
+    [w bringSubviewToFront:h];
+    gBusyHint = h;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (gBusyHint == h) { [h removeFromSuperview]; gBusyHint = nil; }
+    });
 }
 
 @end
@@ -697,55 +719,85 @@ static NSArray *LoadSwipePts(NSString *key) {
     return a ?: @[];
 }
 
-// v1.0.1：按录制时间戳逐点注入，完美复原真实滑动。
-// 关键修复：fakeTouchId 是 UIKit 事件注入，必须在【主线程】调用。
-// 原实现把它丢到后台 gSwipeQueue 导致 UIKit/CoreAnimation 在后台线程断言陷阱（EXC_BREAKPOINT 闪退）。
-// 改为照搬 PageTurnerDylib 验证过的「主线程 dispatch_after 递归调度」：不阻塞主线程，且全程在主线程。
+// v1.0.4：滑动回放改用 CADisplayLink 驱动——对齐屏幕刷新率（VSync），
+// 每帧按【真实经过时间】插值出当前触摸坐标并注入一次 Moved，彻底消除 dispatch_after 抖动导致的卡顿。
+// 回放时长 = 录制时长（1:1 还原真实手指的流畅感）。
+static BOOL gSwipeRunning = NO;   // 防狂按：回放进行中
+
+@interface DVTSwipeTickProxy : NSObject
+@property (nonatomic, copy) void (^tick)(void);
+- (void)onTick:(CADisplayLink *)link;
+@end
+@implementation DVTSwipeTickProxy
+- (void)onTick:(CADisplayLink *)link { if (_tick) _tick(); }
+@end
+
+// 按时间线性插值取坐标（二分定位区间）
+static CGPoint DVTSwipeInterp(NSArray *xs, NSArray *ys, NSArray *ts, double targetT) {
+    NSUInteger m = [ts count];
+    if (m == 0) return CGPointZero;
+    double t0 = [ts[0] doubleValue], tEnd = [ts[m-1] doubleValue];
+    if (targetT <= t0)   return CGPointMake([xs[0] doubleValue], [ys[0] doubleValue]);
+    if (targetT >= tEnd) return CGPointMake([xs[m-1] doubleValue], [ys[m-1] doubleValue]);
+    NSUInteger lo = 0, hi = m - 1;
+    while (hi - lo > 1) {
+        NSUInteger mid = (lo + hi) / 2;
+        if ([ts[mid] doubleValue] <= targetT) lo = mid; else hi = mid;
+    }
+    double ta = [ts[lo] doubleValue], tb = [ts[hi] doubleValue];
+    double fa = [xs[lo] doubleValue], fb = [xs[hi] doubleValue];
+    double ga = [ys[lo] doubleValue], gb = [ys[hi] doubleValue];
+    double f = (tb - ta) > 1e-6 ? (targetT - ta) / (tb - ta) : 0.0;
+    return CGPointMake(fa + (fb - fa) * f, ga + (gb - ga) * f);
+}
+
 static void DVTFakeSwipe(NSArray *pts, BOOL isPlus) {
-    if (!pts || pts.count < 2) return;
+    if (!pts || [pts count] < 2) { gSwipeRunning = NO; return; }
+    // 预解析 [x,y,t]，避免每帧反复解包
+    NSMutableArray *xs = [NSMutableArray array], *ys = [NSMutableArray array], *ts = [NSMutableArray array];
+    for (NSUInteger i = 0; i < [pts count]; i++) {
+        NSArray *p = pts[i];
+        if ([p count] < 3) continue;
+        [xs addObject:@([p[0] floatValue])];
+        [ys addObject:@([p[1] floatValue])];
+        [ts addObject:@([p[2] doubleValue])];
+    }
+    NSUInteger m = [ts count];
+    if (m < 2) { gSwipeRunning = NO; return; }
+    double t0 = [ts[0] doubleValue];
+    double totalMs = [ts[m-1] doubleValue] - t0;
+    if (totalMs <= 0) totalMs = 1.0;
+
     __block NSInteger pid = -1;
-    __block NSUInteger idx = 0;
-    __block void (^step)(void);
-    step = ^(void) {
-        if (idx >= pts.count) {
-            LogDVT(@"滑动模式回放 %@ 完成 点数=%lu", isPlus ? @"音量+" : @"音量-", (unsigned long)pts.count);
-            if ([AutoSkipSettingsCenter isDebugEnabled]) [AutoSkipSettingsCenter dvtEndTrail];
-            return;
-        }
-        NSArray *p = pts[idx];
-        if (p.count < 3) { idx++; step(); return; }   // 跳过坏点
-        float x = [p[0] floatValue], y = [p[1] floatValue];
-        float t = [p[2] floatValue];   // 相对录制起点的毫秒
-        CGPoint pt = CGPointMake(x, y);
-        UITouchPhase ph = (idx == 0) ? UITouchPhaseBegan
-                        : ((idx == pts.count - 1) ? UITouchPhaseEnded : UITouchPhaseMoved);
-        if (idx == 0) {
-            pid = [PTFakeMetaTouch fakeTouchId:1 AtPoint:pt withTouchPhase:ph];
-            // 轨迹可视化（抄袭 PT deb 版 PTRecTick：回放开始即逐点延伸，而非结束才闪现）
+    __block CFAbsoluteTime startT = CFAbsoluteTimeGetCurrent();
+    __block DVTSwipeTickProxy *bProxy = [[DVTSwipeTickProxy alloc] init];
+    __block CADisplayLink *bLink = [CADisplayLink displayLinkWithTarget:bProxy selector:@selector(onTick:)];
+    [bLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+
+    if ([AutoSkipSettingsCenter isDebugEnabled]) {
+        [AutoSkipSettingsCenter dvtBeginTrail:isPlus firstPoint:CGPointMake([xs[0] doubleValue], [ys[0] doubleValue])];
+    }
+
+    bProxy.tick = ^{
+        double elapsedMs = (CFAbsoluteTimeGetCurrent() - startT) * 1000.0;
+        CGPoint cur = DVTSwipeInterp(xs, ys, ts, t0 + elapsedMs);
+        if (pid < 0) pid = [PTFakeMetaTouch fakeTouchId:1 AtPoint:cur withTouchPhase:UITouchPhaseBegan];
+        else          [PTFakeMetaTouch fakeTouchId:pid AtPoint:cur withTouchPhase:UITouchPhaseMoved];
+        if ([AutoSkipSettingsCenter isDebugEnabled]) [AutoSkipSettingsCenter dvtExtendTrailTo:cur isPlus:isPlus];
+        if (elapsedMs >= totalMs) {
+            CGPoint end = CGPointMake([xs[m-1] doubleValue], [ys[m-1] doubleValue]);
+            [PTFakeMetaTouch fakeTouchId:pid AtPoint:end withTouchPhase:UITouchPhaseEnded];
             if ([AutoSkipSettingsCenter isDebugEnabled]) {
-                [AutoSkipSettingsCenter dvtBeginTrail:isPlus];
-                [AutoSkipSettingsCenter dvtUpdateTrail:pts upTo:1 isPlus:isPlus];
+                [AutoSkipSettingsCenter dvtExtendTrailTo:end isPlus:isPlus];
+                [AutoSkipSettingsCenter dvtEndTrail];
             }
-        } else {
-            [PTFakeMetaTouch fakeTouchId:pid AtPoint:pt withTouchPhase:ph];
-            if ([AutoSkipSettingsCenter isDebugEnabled]) {
-                [AutoSkipSettingsCenter dvtUpdateTrail:pts upTo:(idx + 1) isPlus:isPlus];
-            }
+            [bLink invalidate];
+            bLink = nil;
+            bProxy = nil;   // 打破循环引用，释放
+            gSwipeRunning = NO;
+            LogDVT(@"滑动模式回放 %@ 完成 点数=%lu", isPlus ? @"音量+" : @"音量-", (unsigned long)m);
         }
-        idx++;
-        if (idx >= pts.count) {
-            LogDVT(@"滑动模式回放 %@ 完成 点数=%lu", isPlus ? @"音量+" : @"音量-", (unsigned long)pts.count);
-            if ([AutoSkipSettingsCenter isDebugEnabled]) [AutoSkipSettingsCenter dvtEndTrail];
-            return;
-        }
-        // 与下一点之间的等待（基于录制时间戳，最小 8ms 防风暴——PageTurnerDylib 同款）
-        NSArray *nxt = pts[idx];
-        float waitMs = (nxt.count >= 3) ? ([nxt[2] floatValue] - t) : 8.0f;
-        if (waitMs < 8.0f) waitMs = 8.0f;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(waitMs * NSEC_PER_SEC / 1000)),
-                       dispatch_get_main_queue(), step);
     };
-    step();
 }
 
 // 按方向点击/滑动：delta>0 音量+，delta<0 音量-
@@ -753,13 +805,18 @@ static void TapPoints(float delta) {
     BOOL isPlus = (delta > 0);
     // v1.0.1：滑动模式 → 按录制轨迹完美回放
     if ([[Defaults() objectForKey:@"mode"] isEqualToString:@"swipe"]) {
+        if (gSwipeRunning) {   // 防狂按：回放进行中，拦截新触发并提示
+            [AutoSkipSettingsCenter showBusyHint];
+            return;
+        }
         NSArray *pts = isPlus ? LoadSwipePts(@"swipePlus") : LoadSwipePts(@"swipeMinus");
         if (pts.count < 2) {
             LogDVT(@"滑动模式：%@ 未录制轨迹（三指长按→滑动模式设置）", isPlus ? @"音量+" : @"音量-");
             ShowToast([NSString stringWithFormat:@"滑动模式未录制%@轨迹", isPlus ? @"音量+" : @"音量-"]);
             return;
         }
-        // fakeTouchId 必须主线程：先切主队列，由 DVTFakeSwipe 内部递归 dispatch_after(main) 逐点回放
+        gSwipeRunning = YES;   // 标记回放中（狂按将被拦截）
+        // fakeTouchId 必须主线程：切主队列，由 DVTFakeSwipe 内部 CADisplayLink(main) 逐帧回放
         dispatch_async(dispatch_get_main_queue(), ^{ DVTFakeSwipe(pts, isPlus); });
         return;
     }
