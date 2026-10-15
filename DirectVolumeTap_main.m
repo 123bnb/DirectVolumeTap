@@ -1,4 +1,4 @@
-// DirectVolumeTap v1.0.2 — 独立版（自包含，注入即生效）
+// DirectVolumeTap v1.0.3 — 独立版（自包含，注入即生效）
 // 不依赖任何设置页/配置：把 dylib 注入哪个 App，就在哪个 App 生效。
 //   ① 三指长按 → 弹出「菜单」：
 //        - 音量键设置（可点进去）：出现一红一绿两个大圆点，可自由拖动，
@@ -92,7 +92,9 @@ static BOOL DebugEnabled(void) {
 - (void)loadSwipes;
 - (void)drawSwipeTrails;
 - (void)drawPath:(NSArray *)pts color:(UIColor *)color alpha:(CGFloat)alpha;
-+ (void)showDebugSwipeTrail:(NSArray *)pts isPlus:(BOOL)isPlus;
++ (void)dvtBeginTrail:(BOOL)isPlus;
++ (void)dvtUpdateTrail:(NSArray *)pts upTo:(NSUInteger)count isPlus:(BOOL)isPlus;
++ (void)dvtEndTrail;
 @property (nonatomic, strong) NSMutableArray *swipePlusPts;        // 音量+ 轨迹点(NSArray<[x,y,t]>)
 @property (nonatomic, strong) NSMutableArray *swipeMinusPts;       // 音量- 轨迹点
 @property (nonatomic, strong) NSMutableArray *currentRecording;
@@ -248,7 +250,7 @@ static BOOL DebugEnabled(void) {
     dbgRow.backgroundColor = [UIColor colorWithWhite:0.93 alpha:1];
     [panel addSubview:dbgRow];
     UILabel *dbgLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 0, pw - 120, 46)];
-    dbgLabel.text = @"调试开关";
+    dbgLabel.text = @"轨迹可视化";
     dbgLabel.textColor = [UIColor darkGrayColor];
     dbgLabel.font = [UIFont systemFontOfSize:16];
     [dbgRow addSubview:dbgLabel];
@@ -547,7 +549,7 @@ static BOOL DebugEnabled(void) {
     NSUserDefaults *d = Defaults();
     [d setBool:sw.on forKey:@"debugEnabled"];
     [d synchronize];
-    LogDVT(@"调试开关 -> %@", sw.on ? @"开" : @"关");
+    LogDVT(@"轨迹可视化 -> %@", sw.on ? @"开" : @"关");
 }
 
 + (BOOL)isDebugEnabled {
@@ -603,26 +605,48 @@ static BOOL DebugEnabled(void) {
     });
 }
 
-// v1.0.1：调试开关打开时，滑动模式触发短暂重放整条轨迹线（CAShapeLayer 不拦截触摸，1.5s 消失）
-+ (void)showDebugSwipeTrail:(NSArray *)pts isPlus:(BOOL)isPlus {
+// v1.0.2：滑动回放轨迹可视化——抄袭 PageTurner deb 版的「逐点累积重绘 path」机制
+// 原 showDebugSwipeTrail 在回放【全部结束】后才画整条线 → 「滑完才闪现」；
+// 改为：回放每注入一点就实时延伸轨迹（对应 PT 的 PTRecTick / gRecTrailLayer 逐点更新 path）。
+static CAShapeLayer *gDVTTrailLayer = nil;   // 回放轨迹层（复用，避免叠加）
+
+// 回放开始：创建轨迹层并挂到 keyWindow
++ (void)dvtBeginTrail:(BOOL)isPlus {
     UIWindow *w = FindKeyWindow();
-    if (!w || !pts || pts.count < 2) return;
-    UIBezierPath *path = [UIBezierPath new];
-    for (NSUInteger i = 0; i < pts.count; i++) {
-        NSArray *p = pts[i];
-        if (p.count < 2) continue;
-        CGPoint pt = CGPointMake([p[0] floatValue], [p[1] floatValue]);
-        if (i == 0) [path moveToPoint:pt]; else [path addLineToPoint:pt];
-    }
-    CAShapeLayer *sl = [CAShapeLayer new];
-    sl.path = path.CGPath;
+    if (!w) return;
+    if (gDVTTrailLayer) { [gDVTTrailLayer removeFromSuperlayer]; gDVTTrailLayer = nil; }
+    CAShapeLayer *sl = [CAShapeLayer layer];
     sl.strokeColor = (isPlus ? [UIColor systemGreenColor] : [UIColor systemRedColor]).CGColor;
-    sl.lineWidth = 6;
-    sl.fillColor = [UIColor clearColor].CGColor;
-    sl.lineCap = kCALineCapRound;
-    sl.lineJoin = kCALineJoinRound;
-    sl.opacity = 0.9;
+    sl.fillColor   = [UIColor clearColor].CGColor;
+    sl.lineWidth   = 6;
+    sl.lineCap     = kCALineCapRound;
+    sl.lineJoin    = kCALineJoinRound;
+    sl.opacity     = 0.9;
     [w.layer addSublayer:sl];
+    gDVTTrailLayer = sl;
+}
+
+// 回放过程中：把已注入的前 count 个点重绘成路径（逐点延伸，对应 PTRecTick）
++ (void)dvtUpdateTrail:(NSArray *)pts upTo:(NSUInteger)count isPlus:(BOOL)isPlus {
+    if (!gDVTTrailLayer || !pts || count == 0) return;
+    CGMutablePathRef path = CGPathCreateMutable();
+    BOOL first = YES;
+    for (NSUInteger i = 0; i < count && i < pts.count; i++) {
+        NSArray *p = pts[i];
+        if (p.count < 3) continue;
+        CGPoint pt = CGPointMake([p[0] floatValue], [p[1] floatValue]);
+        if (first) { CGPathMoveToPoint(path, NULL, pt.x, pt.y); first = NO; }
+        else       { CGPathAddLineToPoint(path, NULL, pt.x, pt.y); }
+    }
+    gDVTTrailLayer.path = path;
+    CGPathRelease(path);
+}
+
+// 回放结束：延迟移除轨迹层
++ (void)dvtEndTrail {
+    CAShapeLayer *sl = gDVTTrailLayer;
+    gDVTTrailLayer = nil;
+    if (!sl) return;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ [sl removeFromSuperlayer]; });
 }
@@ -685,9 +709,7 @@ static void DVTFakeSwipe(NSArray *pts, BOOL isPlus) {
     step = ^(void) {
         if (idx >= pts.count) {
             LogDVT(@"滑动模式回放 %@ 完成 点数=%lu", isPlus ? @"音量+" : @"音量-", (unsigned long)pts.count);
-            if ([AutoSkipSettingsCenter isDebugEnabled]) {
-                [AutoSkipSettingsCenter showDebugSwipeTrail:pts isPlus:isPlus];
-            }
+            if ([AutoSkipSettingsCenter isDebugEnabled]) [AutoSkipSettingsCenter dvtEndTrail];
             return;
         }
         NSArray *p = pts[idx];
@@ -697,14 +719,23 @@ static void DVTFakeSwipe(NSArray *pts, BOOL isPlus) {
         CGPoint pt = CGPointMake(x, y);
         UITouchPhase ph = (idx == 0) ? UITouchPhaseBegan
                         : ((idx == pts.count - 1) ? UITouchPhaseEnded : UITouchPhaseMoved);
-        if (idx == 0) pid = [PTFakeMetaTouch fakeTouchId:1 AtPoint:pt withTouchPhase:ph];
-        else          [PTFakeMetaTouch fakeTouchId:pid AtPoint:pt withTouchPhase:ph];
+        if (idx == 0) {
+            pid = [PTFakeMetaTouch fakeTouchId:1 AtPoint:pt withTouchPhase:ph];
+            // 轨迹可视化（抄袭 PT deb 版 PTRecTick：回放开始即逐点延伸，而非结束才闪现）
+            if ([AutoSkipSettingsCenter isDebugEnabled]) {
+                [AutoSkipSettingsCenter dvtBeginTrail:isPlus];
+                [AutoSkipSettingsCenter dvtUpdateTrail:pts upTo:1 isPlus:isPlus];
+            }
+        } else {
+            [PTFakeMetaTouch fakeTouchId:pid AtPoint:pt withTouchPhase:ph];
+            if ([AutoSkipSettingsCenter isDebugEnabled]) {
+                [AutoSkipSettingsCenter dvtUpdateTrail:pts upTo:(idx + 1) isPlus:isPlus];
+            }
+        }
         idx++;
         if (idx >= pts.count) {
             LogDVT(@"滑动模式回放 %@ 完成 点数=%lu", isPlus ? @"音量+" : @"音量-", (unsigned long)pts.count);
-            if ([AutoSkipSettingsCenter isDebugEnabled]) {
-                [AutoSkipSettingsCenter showDebugSwipeTrail:pts isPlus:isPlus];
-            }
+            if ([AutoSkipSettingsCenter isDebugEnabled]) [AutoSkipSettingsCenter dvtEndTrail];
             return;
         }
         // 与下一点之间的等待（基于录制时间戳，最小 8ms 防风暴——PageTurnerDylib 同款）
