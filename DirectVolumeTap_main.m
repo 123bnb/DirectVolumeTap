@@ -1,4 +1,4 @@
-// DirectVolumeTap v1.0.5 — 独立版（自包含，注入即生效）
+// DirectVolumeTap v1.0.6 — 独立版（自包含，注入即生效）
 // 不依赖任何设置页/配置：把 dylib 注入哪个 App，就在哪个 App 生效。
 //   ① 三指长按 → 弹出「菜单」：
 //        - 音量键设置（可点进去）：出现一红一绿两个大圆点，可自由拖动，
@@ -193,7 +193,7 @@ static BOOL DebugEnabled(void) {
 
     // 菜单面板
     CGFloat pw = MIN(window.bounds.size.width - 40, 320);
-    CGFloat ph = 256;
+    CGFloat ph = 268;
     UIView *panel = [[UIView alloc] initWithFrame:CGRectMake((window.bounds.size.width - pw)/2,
                                                              (window.bounds.size.height - ph)/2,
                                                              pw, ph)];
@@ -235,18 +235,8 @@ static BOOL DebugEnabled(void) {
     [modeBtn addTarget:self action:@selector(toggleVolumeMode) forControlEvents:UIControlEventTouchUpInside];
     [panel addSubview:modeBtn];
 
-    // 当前模式入口：点击模式 / 滑动模式 二选一，点进入对应设置
-    UIButton *modeEntry = [UIButton buttonWithType:UIButtonTypeSystem];
-    modeEntry.frame = CGRectMake(16, 110, pw - 32, 46);
-    [modeEntry setTitle:(isSwipe ? @"滑动模式 ▸ 点击设置" : @"点击模式 ▸ 点击设置") forState:UIControlStateNormal];
-    [modeEntry setTitleColor:[UIColor darkGrayColor] forState:UIControlStateNormal];
-    modeEntry.backgroundColor = [UIColor colorWithWhite:0.93 alpha:1];
-    modeEntry.layer.cornerRadius = 10;
-    [modeEntry addTarget:self action:(isSwipe ? @selector(openSwipeModeSettings) : @selector(openVolumeSettings)) forControlEvents:UIControlEventTouchUpInside];
-    [panel addSubview:modeEntry];
-
-    // 调试开关行
-    UIView *dbgRow = [[UIView alloc] initWithFrame:CGRectMake(16, 168, pw - 32, 46)];
+    // 调试开关行（轨迹可视化）
+    UIView *dbgRow = [[UIView alloc] initWithFrame:CGRectMake(16, 106, pw - 32, 46)];
     dbgRow.layer.cornerRadius = 10;
     dbgRow.backgroundColor = [UIColor colorWithWhite:0.93 alpha:1];
     [panel addSubview:dbgRow];
@@ -259,6 +249,40 @@ static BOOL DebugEnabled(void) {
     self.debugSwitch.on = DebugEnabled();
     [self.debugSwitch addTarget:self action:@selector(onDebugSwitchChanged:) forControlEvents:UIControlEventValueChanged];
     [dbgRow addSubview:self.debugSwitch];
+
+    // 回放速率行（滑动模式回放快慢 + 轨迹可视化同步），位于【轨迹可视化】与【模式入口】之间
+    UIView *rateRow = [[UIView alloc] initWithFrame:CGRectMake(16, 158, pw - 32, 46)];
+    rateRow.layer.cornerRadius = 10;
+    rateRow.backgroundColor = [UIColor colorWithWhite:0.93 alpha:1];
+    [panel addSubview:rateRow];
+    UILabel *rateTitle = [[UILabel alloc] initWithFrame:CGRectMake(12, 0, 84, 46)];
+    rateTitle.text = @"回放速率";
+    rateTitle.textColor = [UIColor darkGrayColor];
+    rateTitle.font = [UIFont systemFontOfSize:16];
+    [rateRow addSubview:rateTitle];
+    UISlider *rateSlider = [[UISlider alloc] initWithFrame:CGRectMake(96, 8, (pw - 32) - 74 - 96 - 4, 30)];
+    rateSlider.minimumValue = 0.5f;
+    rateSlider.maximumValue = 2.0f;
+    rateSlider.value = DVTGetRate();
+    [rateSlider addTarget:self action:@selector(onRateChanged:) forControlEvents:UIControlEventValueChanged];
+    [rateRow addSubview:rateSlider];
+    UILabel *rateVal = [[UILabel alloc] initWithFrame:CGRectMake((pw - 32) - 74, 0, 62, 46)];
+    rateVal.textAlignment = NSTextAlignmentRight;
+    rateVal.textColor = [UIColor darkGrayColor];
+    rateVal.font = [UIFont systemFontOfSize:14];
+    rateVal.text = [NSString stringWithFormat:@"x%.1f", DVTGetRate()];
+    rateVal.tag = 9911;   // 供 onRateChanged 实时更新
+    [rateRow addSubview:rateVal];
+
+    // 当前模式入口：点击模式 / 滑动模式 二选一，点进入对应设置
+    UIButton *modeEntry = [UIButton buttonWithType:UIButtonTypeSystem];
+    modeEntry.frame = CGRectMake(16, 210, pw - 32, 46);
+    [modeEntry setTitle:(isSwipe ? @"滑动模式 ▸ 点击设置" : @"点击模式 ▸ 点击设置") forState:UIControlStateNormal];
+    [modeEntry setTitleColor:[UIColor darkGrayColor] forState:UIControlStateNormal];
+    modeEntry.backgroundColor = [UIColor colorWithWhite:0.93 alpha:1];
+    modeEntry.layer.cornerRadius = 10;
+    [modeEntry addTarget:self action:(isSwipe ? @selector(openSwipeModeSettings) : @selector(openVolumeSettings)) forControlEvents:UIControlEventTouchUpInside];
+    [panel addSubview:modeEntry];
 
     [window addSubview:mv];
     LogDVT(@"菜单已显示");
@@ -449,8 +473,8 @@ static BOOL DebugEnabled(void) {
     float r = s.value;
     [Defaults() setObject:@(r) forKey:@"swipeRate"];
     [Defaults() synchronize];
-    UILabel *lbl = (UILabel *)[self.overlay viewWithTag:9911];
-    if (lbl) lbl.text = [NSString stringWithFormat:@"回放速率 x%.1f（轨迹同步）", r];
+    UILabel *lbl = (UILabel *)[s.superview viewWithTag:9911];
+    if (lbl) lbl.text = [NSString stringWithFormat:@"x%.1f", r];
     LogDVT(@"回放速率 -> x%.1f", r);
 }
 
