@@ -1,4 +1,4 @@
-// DirectVolumeTap v1.0.4 — 独立版（自包含，注入即生效）
+// DirectVolumeTap v1.0.5 — 独立版（自包含，注入即生效）
 // 不依赖任何设置页/配置：把 dylib 注入哪个 App，就在哪个 App 生效。
 //   ① 三指长按 → 弹出「菜单」：
 //        - 音量键设置（可点进去）：出现一红一绿两个大圆点，可自由拖动，
@@ -444,6 +444,16 @@ static BOOL DebugEnabled(void) {
     [self showMenuInWindow:[UIApplication sharedApplication].keyWindow];
 }
 
+// v1.0.5：回放速率变更（影响回放快慢 + 轨迹可视化同步）
+- (void)onRateChanged:(UISlider *)s {
+    float r = s.value;
+    [Defaults() setObject:@(r) forKey:@"swipeRate"];
+    [Defaults() synchronize];
+    UILabel *lbl = (UILabel *)[self.overlay viewWithTag:9911];
+    if (lbl) lbl.text = [NSString stringWithFormat:@"回放速率 x%.1f（轨迹同步）", r];
+    LogDVT(@"回放速率 -> x%.1f", r);
+}
+
 - (void)saveSwipes {
     NSUserDefaults *d = Defaults();
     [d setObject:(self.swipePlusPts ?: @[]) forKey:@"swipePlus"];
@@ -732,6 +742,32 @@ static BOOL gSwipeRunning = NO;   // 防狂按：回放进行中
 - (void)onTick:(CADisplayLink *)link { if (_tick) _tick(); }
 @end
 
+// v1.0.5：回放上下文（全局单例），保证 invalidate / 收尾 成对，从根上杜绝狂按卡死
+static CADisplayLink    *gSwipeLink = nil;
+static DVTSwipeTickProxy *gSwipeProxy = nil;
+static NSInteger         gSwipePid = -1;
+static BOOL              gSwipeEnded = NO;    // 是否已注入 Ended（防重复注入）
+static BOOL              gSwipeFinished = NO; // 是否已收尾（防重复收尾）
+static dispatch_block_t  gSwipeWatchdog = nil;
+
+// 回放速率（影响快慢，轨迹可视化同步），默认 1.0，范围 0.5~2.0
+static float DVTGetRate(void) {
+    float r = [[Defaults() objectForKey:@"swipeRate"] floatValue];
+    if (r < 0.5f || r > 2.0f) r = 1.0f;
+    return r;
+}
+
+// 回放收尾：只执行一次，成对清理 link / proxy / watchdog / 防狂按标志，绝不卡死
+static void dvtFinishSwipe(void) {
+    if (gSwipeFinished) return;
+    gSwipeFinished = YES;
+    if (gSwipeLink) { [gSwipeLink invalidate]; gSwipeLink = nil; }
+    gSwipeProxy = nil;
+    if (gSwipeWatchdog) { dispatch_block_cancel(gSwipeWatchdog); gSwipeWatchdog = nil; }
+    gSwipeRunning = NO;
+    LogDVT(@"滑动回放收尾（强制重置状态）");
+}
+
 // 按时间线性插值取坐标（二分定位区间）
 static CGPoint DVTSwipeInterp(NSArray *xs, NSArray *ys, NSArray *ts, double targetT) {
     NSUInteger m = [ts count];
@@ -767,37 +803,60 @@ static void DVTFakeSwipe(NSArray *pts, BOOL isPlus) {
     double t0 = [ts[0] doubleValue];
     double totalMs = [ts[m-1] doubleValue] - t0;
     if (totalMs <= 0) totalMs = 1.0;
+    float rate = DVTGetRate();
+    double effTotal = totalMs / rate;   // 速率>1 更快，<1 更慢
 
-    __block NSInteger pid = -1;
+    // 初始化回放上下文
+    gSwipePid = -1;
+    gSwipeEnded = NO;
+    gSwipeFinished = NO;
+    gSwipeRunning = YES;
+    gSwipeProxy = [[DVTSwipeTickProxy alloc] init];
     __block CFAbsoluteTime startT = CFAbsoluteTimeGetCurrent();
-    __block DVTSwipeTickProxy *bProxy = [[DVTSwipeTickProxy alloc] init];
-    __block CADisplayLink *bLink = [CADisplayLink displayLinkWithTarget:bProxy selector:@selector(onTick:)];
-    [bLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+    gSwipeLink = [CADisplayLink displayLinkWithTarget:gSwipeProxy selector:@selector(onTick:)];
+    [gSwipeLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
 
     if ([AutoSkipSettingsCenter isDebugEnabled]) {
         [AutoSkipSettingsCenter dvtBeginTrail:isPlus firstPoint:CGPointMake([xs[0] doubleValue], [ys[0] doubleValue])];
     }
 
-    bProxy.tick = ^{
+    gSwipeProxy.tick = ^{
         double elapsedMs = (CFAbsoluteTimeGetCurrent() - startT) * 1000.0;
-        CGPoint cur = DVTSwipeInterp(xs, ys, ts, t0 + elapsedMs);
-        if (pid < 0) pid = [PTFakeMetaTouch fakeTouchId:1 AtPoint:cur withTouchPhase:UITouchPhaseBegan];
-        else          [PTFakeMetaTouch fakeTouchId:pid AtPoint:cur withTouchPhase:UITouchPhaseMoved];
+        double targetT = t0 + elapsedMs * rate;   // 按速率推进插值时间
+        CGPoint cur = DVTSwipeInterp(xs, ys, ts, targetT);
+        if (gSwipePid < 0) gSwipePid = [PTFakeMetaTouch fakeTouchId:1 AtPoint:cur withTouchPhase:UITouchPhaseBegan];
+        else               [PTFakeMetaTouch fakeTouchId:gSwipePid AtPoint:cur withTouchPhase:UITouchPhaseMoved];
         if ([AutoSkipSettingsCenter isDebugEnabled]) [AutoSkipSettingsCenter dvtExtendTrailTo:cur isPlus:isPlus];
-        if (elapsedMs >= totalMs) {
+        if (elapsedMs >= effTotal) {
             CGPoint end = CGPointMake([xs[m-1] doubleValue], [ys[m-1] doubleValue]);
-            [PTFakeMetaTouch fakeTouchId:pid AtPoint:end withTouchPhase:UITouchPhaseEnded];
+            if (!gSwipeEnded) {
+                [PTFakeMetaTouch fakeTouchId:gSwipePid AtPoint:end withTouchPhase:UITouchPhaseEnded];
+                gSwipeEnded = YES;
+            }
             if ([AutoSkipSettingsCenter isDebugEnabled]) {
                 [AutoSkipSettingsCenter dvtExtendTrailTo:end isPlus:isPlus];
                 [AutoSkipSettingsCenter dvtEndTrail];
             }
-            [bLink invalidate];
-            bLink = nil;
-            bProxy = nil;   // 打破循环引用，释放
-            gSwipeRunning = NO;
-            LogDVT(@"滑动模式回放 %@ 完成 点数=%lu", isPlus ? @"音量+" : @"音量-", (unsigned long)m);
+            dvtFinishSwipe();
         }
     };
+
+    // v1.0.5：兜底看门狗——无论 DisplayLink 是否触发末帧，到 effTotal+120ms 必强制收尾，
+    // 杜绝「狂按导致末帧未触发 → gSwipeRunning 永久卡死」的问题。
+    double wdogMs = effTotal + 120.0;
+    dispatch_block_t wdog = dispatch_block_create(0, ^{
+        if (gSwipeFinished) return;
+        CGPoint end = CGPointMake([xs[m-1] doubleValue], [ys[m-1] doubleValue]);
+        if (gSwipePid >= 0 && !gSwipeEnded) {
+            [PTFakeMetaTouch fakeTouchId:gSwipePid AtPoint:end withTouchPhase:UITouchPhaseEnded];
+            gSwipeEnded = YES;
+        }
+        if ([AutoSkipSettingsCenter isDebugEnabled]) [AutoSkipSettingsCenter dvtEndTrail];
+        dvtFinishSwipe();
+    });
+    gSwipeWatchdog = wdog;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wdogMs * NSEC_PER_SEC / 1000.0)),
+                   dispatch_get_main_queue(), wdog);
 }
 
 // 按方向点击/滑动：delta>0 音量+，delta<0 音量-
