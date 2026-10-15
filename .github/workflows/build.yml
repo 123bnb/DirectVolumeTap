@@ -1,9 +1,12 @@
 name: Build DirectVolumeTap
 
+# 一个版本 = 一次运行：只在打 v* 标签时触发发布构建。
+# 推 main 不再自动跑（避免产生多余的 dev 运行）。
+# workflow_dispatch 仅供手动单发测试，不会自动触发。
 on:
   push:
-    branches: [ main ]
     tags: [ 'v*' ]
+  workflow_dispatch:
 
 jobs:
   build:
