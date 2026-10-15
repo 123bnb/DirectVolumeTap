@@ -1,0 +1,73 @@
+name: Build DirectVolumeTap
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get iOS 16.5 SDK
+        uses: actions/checkout@v4
+        with:
+          repository: theos/sdks
+          sparse-checkout: iPhoneOS16.5.sdk
+          path: sdks
+
+      - name: Install ldid
+        run: brew install ldid
+
+      - name: Compute version
+        id: ver
+        run: |
+          VER="dev-$(echo ${GITHUB_SHA} | cut -c1-7)"
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then VER="${GITHUB_REF_NAME}"; fi
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          echo "VERSION=${VER}"
+
+      - name: Build & sign dylib (pure clang, PTFakeTouch native)
+        run: |
+          SDK="$GITHUB_WORKSPACE/sdks/iPhoneOS16.5.sdk"
+          ls -d "$SDK" || echo "SDK 路径: $SDK"
+          mkdir -p out
+          VER="${{ steps.ver.outputs.version }}"
+          SRCS="DirectVolumeTap_main.m ptftouch/PTFakeMetaTouch.m ptftouch/UITouch-KIFAdditions.m ptftouch/UIEvent+KIFAdditions.m ptftouch/IOHIDEvent+KIF.m"
+          # 先试 arm64+arm64e；arm64e 若失败则只 arm64
+          clang -arch arm64 -arch arm64e -isysroot "$SDK" -miphoneos-version-min=15.0 \
+            -fobjc-arc -fobjc-abi-version=2 \
+            -Wl,-undefined,dynamic_lookup \
+            -Wno-unused-variable -Wno-deprecated-declarations -Wno-arc-performSelector-leaks \
+            -Iptftouch -include ptftouch/Compat.h \
+            -framework Foundation -framework AVFoundation -framework UIKit \
+            -dynamiclib $SRCS -o "out/DirectVolumeTap_${VER}.dylib" \
+            && echo "编译 OK (arm64+arm64e)" \
+            || { echo "arm64+arm64e 失败, 尝试只 arm64"; \
+                 clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=15.0 \
+                   -fobjc-arc -fobjc-abi-version=2 \
+                   -Wl,-undefined,dynamic_lookup \
+                   -Wno-unused-variable -Wno-deprecated-declarations -Wno-arc-performSelector-leaks \
+                   -Iptftouch -include ptftouch/Compat.h \
+                   -framework Foundation -framework AVFoundation -framework UIKit \
+                   -dynamiclib $SRCS -o "out/DirectVolumeTap_${VER}.dylib" \
+                   && echo "编译 OK (仅arm64)"; }
+          file "out/DirectVolumeTap_${VER}.dylib"
+          ldid -S "out/DirectVolumeTap_${VER}.dylib" && echo "ldid 签名 OK"
+
+      - name: Upload artifact (dylib)
+        uses: actions/upload-artifact@v4
+        with:
+          name: DirectVolumeTap-${{ steps.ver.outputs.version }}-dylib
+          path: out/DirectVolumeTap_${{ steps.ver.outputs.version }}.dylib
+
+      - name: Create Release (tag only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/DirectVolumeTap_${{ steps.ver.outputs.version }}.dylib
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
