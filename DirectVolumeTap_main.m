@@ -1,4 +1,4 @@
-// DirectVolumeTap v1.0.6 — 独立版（自包含，注入即生效）
+// DirectVolumeTap v1.0.7 — 独立版（自包含，注入即生效）
 // 不依赖任何设置页/配置：把 dylib 注入哪个 App，就在哪个 App 生效。
 //   ① 三指长按 → 弹出「菜单」：
 //        - 音量键设置（可点进去）：出现一红一绿两个大圆点，可自由拖动，
@@ -236,8 +236,8 @@ static BOOL DebugEnabled(void) {
     [modeBtn addTarget:self action:@selector(toggleVolumeMode) forControlEvents:UIControlEventTouchUpInside];
     [panel addSubview:modeBtn];
 
-    // 调试开关行（轨迹可视化）
-    UIView *dbgRow = [[UIView alloc] initWithFrame:CGRectMake(16, 106, pw - 32, 46)];
+    // 调试开关行（轨迹可视化）—— 顺序第 4 位
+    UIView *dbgRow = [[UIView alloc] initWithFrame:CGRectMake(16, 210, pw - 32, 46)];
     dbgRow.layer.cornerRadius = 10;
     dbgRow.backgroundColor = [UIColor colorWithWhite:0.93 alpha:1];
     [panel addSubview:dbgRow];
@@ -275,9 +275,9 @@ static BOOL DebugEnabled(void) {
     rateVal.tag = 9911;   // 供 onRateChanged 实时更新
     [rateRow addSubview:rateVal];
 
-    // 当前模式入口：点击模式 / 滑动模式 二选一，点进入对应设置
+    // 当前模式入口：点击模式 / 滑动模式 二选一，点进入对应设置 —— 顺序第 2 位
     UIButton *modeEntry = [UIButton buttonWithType:UIButtonTypeSystem];
-    modeEntry.frame = CGRectMake(16, 210, pw - 32, 46);
+    modeEntry.frame = CGRectMake(16, 106, pw - 32, 46);
     [modeEntry setTitle:(isSwipe ? @"滑动模式 ▸ 点击设置" : @"点击模式 ▸ 点击设置") forState:UIControlStateNormal];
     [modeEntry setTitleColor:[UIColor darkGrayColor] forState:UIControlStateNormal];
     modeEntry.backgroundColor = [UIColor colorWithWhite:0.93 alpha:1];
