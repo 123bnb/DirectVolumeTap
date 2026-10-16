@@ -24,6 +24,7 @@
 static BOOL DebugEnabled(void);        // 前向声明，定义见下方
 static UIWindow *FindKeyWindow(void);  // 前向声明，定义见下方（showDebugMarkerAtPoint 复用）
 static float DVTGetRate(void);         // 前向声明，定义见下方（openVolumeSettings 中设置滑块初值会先用到）
+static void ApplyVolumeHudHidden(BOOL hidden);  // 前向声明，定义见下方（菜单开关与启动时调用）
 static NSString *LogPath1 = @"/var/mobile/Library/Preferences/com.yourname.directvolumetap.log";
 static void LogDVT(NSString *fmt, ...) {
     if (!DebugEnabled()) return;   // v1.0.1：调试开关关（默认）时不写盘、不 NSLog，零热路径开销
