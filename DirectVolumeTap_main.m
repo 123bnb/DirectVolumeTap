@@ -1,4 +1,4 @@
-// DirectVolumeTap v1.0.7 — 独立版（自包含，注入即生效）
+// DirectVolumeTap v1.0.8 — 独立版（自包含，注入即生效）
 // 不依赖任何设置页/配置：把 dylib 注入哪个 App，就在哪个 App 生效。
 //   ① 三指长按 → 弹出「菜单」：
 //        - 音量键设置（可点进去）：出现一红一绿两个大圆点，可自由拖动，
@@ -55,6 +55,12 @@ static NSUserDefaults *Defaults(void) {
 // 调试开关默认关闭；打开时按音量键点击会显示轨迹标注
 static BOOL DebugEnabled(void) {
     return [[Defaults() objectForKey:@"debugEnabled"] boolValue];
+}
+
+// 音量可视化开关：默认开 = 隐藏系统音量条（保持当前默认行为）
+static BOOL VolumeHudHidden(void) {
+    id v = [Defaults() objectForKey:@"volumeHudHidden"];
+    return v ? [v boolValue] : YES;
 }
 
 // =====================================================
@@ -194,7 +200,7 @@ static BOOL DebugEnabled(void) {
 
     // 菜单面板
     CGFloat pw = MIN(window.bounds.size.width - 40, 320);
-    CGFloat ph = 268;
+    CGFloat ph = 320;
     UIView *panel = [[UIView alloc] initWithFrame:CGRectMake((window.bounds.size.width - pw)/2,
                                                              (window.bounds.size.height - ph)/2,
                                                              pw, ph)];
@@ -236,8 +242,23 @@ static BOOL DebugEnabled(void) {
     [modeBtn addTarget:self action:@selector(toggleVolumeMode) forControlEvents:UIControlEventTouchUpInside];
     [panel addSubview:modeBtn];
 
-    // 调试开关行（轨迹可视化）—— 顺序第 4 位
-    UIView *dbgRow = [[UIView alloc] initWithFrame:CGRectMake(16, 210, pw - 32, 46)];
+    // 音量可视化开关行（控制音量条隐藏，默认开=隐藏音量条），位于【轨迹可视化】上方
+    UIView *hudRow = [[UIView alloc] initWithFrame:CGRectMake(16, 210, pw - 32, 46)];
+    hudRow.layer.cornerRadius = 10;
+    hudRow.backgroundColor = [UIColor colorWithWhite:0.93 alpha:1];
+    [panel addSubview:hudRow];
+    UILabel *hudLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 0, pw - 120, 46)];
+    hudLabel.text = @"音量可视化";
+    hudLabel.textColor = [UIColor darkGrayColor];
+    hudLabel.font = [UIFont systemFontOfSize:16];
+    [hudRow addSubview:hudLabel];
+    UISwitch *hudSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(pw - 32 - 62, 7, 51, 31)];
+    hudSwitch.on = VolumeHudHidden();
+    [hudSwitch addTarget:self action:@selector(onVolumeHudSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+    [hudRow addSubview:hudSwitch];
+
+    // 调试开关行（轨迹可视化）—— 顺序第 5 位
+    UIView *dbgRow = [[UIView alloc] initWithFrame:CGRectMake(16, 262, pw - 32, 46)];
     dbgRow.layer.cornerRadius = 10;
     dbgRow.backgroundColor = [UIColor colorWithWhite:0.93 alpha:1];
     [panel addSubview:dbgRow];
@@ -586,6 +607,14 @@ static BOOL DebugEnabled(void) {
     [d setBool:sw.on forKey:@"debugEnabled"];
     [d synchronize];
     LogDVT(@"轨迹可视化 -> %@", sw.on ? @"开" : @"关");
+}
+
+- (void)onVolumeHudSwitchChanged:(UISwitch *)sw {
+    NSUserDefaults *d = Defaults();
+    [d setObject:@(sw.on) forKey:@"volumeHudHidden"];
+    [d synchronize];
+    ApplyVolumeHudHidden(sw.on);
+    LogDVT(@"音量可视化(隐藏音量条) -> %@", sw.on ? @"隐藏" : @"显示");
 }
 
 + (BOOL)isDebugEnabled {
@@ -937,9 +966,21 @@ static void TapPointsDebounced(float delta) {
 
 // 复位：到顶/底拉回中间 0.3（双保险 MPVolumeView + AVSystemController）
 static MPVolumeView *gVolView = nil;
+// 应用「隐藏音量条」开关：隐藏→确保 MPVolumeView 挂载（抑制系统 HUD）；显示→移除 MPVolumeView（让系统 HUD 正常弹出）
+static void ApplyVolumeHudHidden(BOOL hidden) {
+    if (hidden) {
+        if (!gVolView) {
+            gVolView = [[MPVolumeView alloc] initWithFrame:CGRectMake(-2000, -2000, 0, 0)];
+        }
+        UIWindow *w = FindKeyWindow();
+        if (w && !gVolView.superview) [w addSubview:gVolView];
+    } else {
+        if (gVolView) { [gVolView removeFromSuperview]; gVolView = nil; }
+    }
+}
 static void SetSystemVolume(float v) {
     @try {
-        if (!gVolView) {
+        if (!gVolView && VolumeHudHidden()) {
             gVolView = [[MPVolumeView alloc] initWithFrame:CGRectMake(-2000, -2000, 0, 0)];
             UIWindow *w = FindKeyWindow();
             if (w) [w addSubview:gVolView];
@@ -1012,9 +1053,13 @@ static void dvtHandleKeyUIEvent(id self, SEL _cmd, id event) {
         UIEvent *ev = (UIEvent *)event;
         long keyCode = [[ev valueForKey:@"keyCode"] longValue];
         if (keyCode == 0xE8 || keyCode == 0xE9) {
-            LogDVT(@"★捕获音量键 keyCode=0x%lX（已拦截，不转发系统，HUD 不弹出）", keyCode);
-            TapPointsDebounced((keyCode == 0xE9) ? 0.05f : -0.05f);
-            return;   // 吞掉按键事件：系统收不到按键 → 音量不变 → 系统音量条(HUD)不再弹出
+            if (VolumeHudHidden()) {
+                LogDVT(@"★捕获音量键 keyCode=0x%lX（已拦截，不转发系统，HUD 不弹出）", keyCode);
+                TapPointsDebounced((keyCode == 0xE9) ? 0.05f : -0.05f);
+                return;   // 吞掉按键事件：系统收不到按键 → 音量不变 → 系统音量条(HUD)不再弹出
+            }
+            // 不隐藏音量条：交还系统处理（HUD 正常弹出），映射改由 KVO outputVolume 触发
+            LogDVT(@"★捕获音量键 keyCode=0x%lX（不拦截，HUD 弹出）", keyCode);
         }
     } @catch (NSException *e) {
         LogDVT(@"key event hook 异常: %@", e);
@@ -1085,6 +1130,7 @@ static void DirectTapInit(void) {
             LogDVT(@"已监听音量 (KVO) 当前=%0.2f", [AVAudioSession sharedInstance].outputVolume);
             InstallKeyHook();
             KeepAudioSessionActive();
+            ApplyVolumeHudHidden(VolumeHudHidden());   // 按开关决定 MPVolumeView 是否挂载（控制系统音量条 HUD）
             float bootVol = [AVAudioSession sharedInstance].outputVolume;
             if (VolumeNeedsReset(bootVol)) {
                 LogDVT(@"启动时音量=%.2f 已在边界，复位到 %.1f", bootVol, kResetVolume);
