@@ -1,4 +1,4 @@
-// DirectVolumeTap v1.0.10 — 独立版（自包含，注入即生效）
+// DirectVolumeTap v1.0.11 — 诊断版（仅加取证日志，逻辑同 v1.0.10）
 // 不依赖任何设置页/配置：把 dylib 注入哪个 App，就在哪个 App 生效。
 //   ① 三指长按 → 弹出「菜单」：
 //        - 音量键设置（可点进去）：出现一红一绿两个大圆点，可自由拖动，
@@ -32,6 +32,25 @@ static void LogDVT(NSString *fmt, ...) {
     NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
     NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], s];
+    FILE *f = fopen(LogPath1.UTF8String, "a");
+    if (f) { fputs(line.UTF8String, f); fclose(f); }
+    @try {
+        NSString *home = NSHomeDirectory();
+        if (home.length) {
+            NSString *p = [home stringByAppendingPathComponent:@"directvolumetap.log"];
+            FILE *g = fopen(p.UTF8String, "a");
+            if (g) { fputs(line.UTF8String, g); fclose(g); }
+        }
+    } @catch (NSException *e) {}
+    NSLog(@"%@", line);
+}
+
+// 诊断版专用：无条件输出（不依赖调试开关），复用写盘 + NSLog。正式版将移除。
+static void DiagLog(NSString *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    NSString *line = [NSString stringWithFormat:@"[DIAG] %@ %@\n", [NSDate date], s];
     FILE *f = fopen(LogPath1.UTF8String, "a");
     if (f) { fputs(line.UTF8String, f); fclose(f); }
     @try {
@@ -980,6 +999,7 @@ static void ApplyVolumeHudHidden(BOOL hidden) {
     }
 }
 static void SetSystemVolume(float v) {
+    DiagLog(@"SetSystemVolume -> target v=%.4f", v);
     @try {
         if (!gVolView && VolumeHudHidden()) {
             gVolView = [[MPVolumeView alloc] initWithFrame:CGRectMake(-2000, -2000, 0, 0)];
@@ -1022,14 +1042,23 @@ static void PinVolume(void) {
                         change:(NSDictionary<NSKeyValueChangeKey, id> *)change
                        context:(void *)context {
     if (![keyPath isEqualToString:@"outputVolume"]) return;
+    NSNumber *oldN = change[NSKeyValueChangeOldKey];
     NSNumber *newN = change[NSKeyValueChangeNewKey];
     if (!newN) return;
     float now = newN.floatValue;
+    float old = oldN ? oldN.floatValue : -1.0f;
+    float diff = fabsf(now - gPinnedVolume);
+    float rawDelta = oldN ? (now - old) : 0.0f;
+    DiagLog(@"KVO enter: now=%.4f old=%.4f pinned=%.4f |now-pin|=%.4f rawDelta(old→now)=%.4f",
+            now, old, gPinnedVolume, diff, rawDelta);
     // 回写/稳态：我们把音量钉回 gPinnedVolume，回写时 now 恰好等于钉定值 → 忽略（无 flag 竞态，不会吞真实按键）
-    if (fabsf(now - gPinnedVolume) < 0.02f) return;
+    if (diff < 0.02f) {
+        DiagLog(@"  -> IGNORED (判定为回写/稳态, |now-pin|<0.02)");
+        return;
+    }
     // 真实按键：now 偏离钉定值。delta 以钉定为基准，规避 old 被回写污染的竞态
     float delta = now - gPinnedVolume;
-    LogDVT(@"音量%@ delta=%+.2f 当前=%0.2f → 触发", delta > 0 ? @"+" : @"-", delta, now);
+    DiagLog(@"  -> TRIGGER dir=%@ delta(对pin)=%.4f rawDelta=%+.4f", delta > 0 ? @"+" : @"-", delta, rawDelta);
     TapPointsDebounced(delta);            // 用这次变化触发点击（+ / - 由 delta 符号决定）
     PinVolume();                          // 立即同步钉回固定值（消除边界循环，下一轮 now==gPinnedVolume 自动忽略）
 }
@@ -1084,7 +1113,7 @@ static void DirectTapInit(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         dispatch_async(dispatch_get_main_queue(), ^{
-            LogDVT(@"[DirectVolumeTap v1.0.10 已注入] 进程=%@ bundleID=%@",
+            LogDVT(@"[DirectVolumeTap v1.0.11 诊断版 已注入] 进程=%@ bundleID=%@",
                    NSProcessInfo.processInfo.processName,
                    [[NSBundle mainBundle] bundleIdentifier]);
             gObs = [DirectVolumeObserver new];
