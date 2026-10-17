@@ -1,4 +1,4 @@
-// DirectVolumeTap v1.0.12 — 诊断版（v1.0.11 + 注入即提醒日志位置，存在/不存在均提示）
+// DirectVolumeTap v1.0.13 — 诊断版（v1.0.12 + 日志改写沙盒 Documents，移除无权限的固定路径/根目录）
 // 不依赖任何设置页/配置：把 dylib 注入哪个 App，就在哪个 App 生效。
 //   ① 三指长按 → 弹出「菜单」：
 //        - 音量键设置（可点进去）：出现一红一绿两个大圆点，可自由拖动，
@@ -9,7 +9,7 @@
 //   ② 触发：音量键（物理/蓝牙翻页器）→ KVO outputVolume（需激活静音音频会话）
 //   ③ 点击：PTFakeMetaTouch 原生库（fakeTouchId:AtPoint:withTouchPhase:），王跳跳同款
 //   ④ 复位：到顶/底自动拉回中间 0.3，防止按键失效
-// 日志：写固定路径 + App 沙盒 + NSLog，便于排查
+// 日志：写 App 沙盒 Documents + NSLog，便于排查（固定路径 /var/mobile/... 与沙盒根目录无权限，已弃用）
 
 #import "ptftouch/PTFakeMetaTouch.h"
 #import <AVFoundation/AVFoundation.h>
@@ -26,23 +26,26 @@ static UIWindow *FindKeyWindow(void);  // 前向声明，定义见下方（showD
 static float DVTGetRate(void);         // 前向声明，定义见下方（openVolumeSettings 中设置滑块初值会先用到）
 static void ApplyVolumeHudHidden(BOOL hidden);  // 前向声明，定义见下方（菜单开关与启动时调用）
 static void ShowLogHint(void);                // 前向声明，定义见下方（注入时提醒日志位置，存在/不存在均提示）
-static NSString *LogPath1 = @"/var/mobile/Library/Preferences/com.yourname.directvolumetap.log";
+// v1.0.13：日志只写沙盒 Documents（固定路径 /var/mobile/... 与沙盒根目录均无权限，已移除）
+static NSString *DVTLogPath(void) {
+    @try {
+        NSArray *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        NSString *docDir = docs.firstObject;
+        if (docDir.length) return [docDir stringByAppendingPathComponent:@"directvolumetap.log"];
+    } @catch (NSException *e) {}
+    return nil;
+}
 static void LogDVT(NSString *fmt, ...) {
     if (!DebugEnabled()) return;   // v1.0.1：调试开关关（默认）时不写盘、不 NSLog，零热路径开销
     va_list ap; va_start(ap, fmt);
     NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
     NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], s];
-    FILE *f = fopen(LogPath1.UTF8String, "a");
-    if (f) { fputs(line.UTF8String, f); fclose(f); }
-    @try {
-        NSString *home = NSHomeDirectory();
-        if (home.length) {
-            NSString *p = [home stringByAppendingPathComponent:@"directvolumetap.log"];
-            FILE *g = fopen(p.UTF8String, "a");
-            if (g) { fputs(line.UTF8String, g); fclose(g); }
-        }
-    } @catch (NSException *e) {}
+    NSString *p = DVTLogPath();
+    if (p.length) {
+        FILE *f = fopen(p.UTF8String, "a");
+        if (f) { fputs(line.UTF8String, f); fclose(f); }
+    }
     NSLog(@"%@", line);
 }
 
@@ -52,16 +55,11 @@ static void DiagLog(NSString *fmt, ...) {
     NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
     NSString *line = [NSString stringWithFormat:@"[DIAG] %@ %@\n", [NSDate date], s];
-    FILE *f = fopen(LogPath1.UTF8String, "a");
-    if (f) { fputs(line.UTF8String, f); fclose(f); }
-    @try {
-        NSString *home = NSHomeDirectory();
-        if (home.length) {
-            NSString *p = [home stringByAppendingPathComponent:@"directvolumetap.log"];
-            FILE *g = fopen(p.UTF8String, "a");
-            if (g) { fputs(line.UTF8String, g); fclose(g); }
-        }
-    } @catch (NSException *e) {}
+    NSString *p = DVTLogPath();
+    if (p.length) {
+        FILE *f = fopen(p.UTF8String, "a");
+        if (f) { fputs(line.UTF8String, f); fclose(f); }
+    }
     NSLog(@"%@", line);
 }
 
@@ -807,19 +805,14 @@ static void ShowLogHint(void) {
     if (gLogHintBox) { [gLogHintBox removeFromSuperview]; gLogHintBox = nil; }
 
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *p1 = LogPath1;                                   // 固定路径
-    NSString *p2 = nil;
-    @try { NSString *home = NSHomeDirectory(); if (home.length) p2 = [home stringByAppendingPathComponent:@"directvolumetap.log"]; } @catch (NSException *e) {}
+    NSString *logPath = DVTLogPath();                           // 沙盒 Documents 内
+    BOOL exists = (logPath.length && [fm fileExistsAtPath:logPath]);
 
     // log 存在就提示「已有」，不存在也提示「暂无」——两种状态都提醒位置
-    BOOL e1 = [fm fileExistsAtPath:p1];
-    BOOL e2 = (p2 && [fm fileExistsAtPath:p2]);
-
-    NSString *mark1 = e1 ? @"●已有" : @"○暂无";
-    NSString *mark2 = e2 ? @"●已有" : @"○暂无";
+    NSString *mark = exists ? @"●已有" : @"○暂无";
     NSMutableString *msg = [NSMutableString stringWithString:@"日志位置（已生成/未生成都会提示）：\n"];
-    [msg appendFormat:@"%@ %@\n", mark1, p1];
-    if (p2) [msg appendFormat:@"%@ %@\n", mark2, p2];
+    if (logPath.length) [msg appendFormat:@"%@ %@\n", mark, logPath];
+    else [msg appendString:@"○暂无 沙盒 Documents 暂不可访问\n"];
 
     UIView *box = [[UIView alloc] init];
     box.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.72];
@@ -1177,7 +1170,7 @@ static void DirectTapInit(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         dispatch_async(dispatch_get_main_queue(), ^{
-            LogDVT(@"[DirectVolumeTap v1.0.12 诊断版 已注入] 进程=%@ bundleID=%@",
+            LogDVT(@"[DirectVolumeTap v1.0.13 诊断版 已注入] 进程=%@ bundleID=%@",
                    NSProcessInfo.processInfo.processName,
                    [[NSBundle mainBundle] bundleIdentifier]);
             gObs = [DirectVolumeObserver new];
