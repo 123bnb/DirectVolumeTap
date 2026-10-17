@@ -1,4 +1,4 @@
-// DirectVolumeTap v1.0.9 — 独立版（自包含，注入即生效）
+// DirectVolumeTap v1.0.10 — 独立版（自包含，注入即生效）
 // 不依赖任何设置页/配置：把 dylib 注入哪个 App，就在哪个 App 生效。
 //   ① 三指长按 → 弹出「菜单」：
 //        - 音量键设置（可点进去）：出现一红一绿两个大圆点，可自由拖动，
@@ -58,7 +58,7 @@ static BOOL DebugEnabled(void) {
     return [[Defaults() objectForKey:@"debugEnabled"] boolValue];
 }
 
-// 音量可视化开关：默认开 = 隐藏系统音量条（保持当前默认行为）
+// 隐藏音量条开关：默认开 = 隐藏系统音量条（保持当前默认行为）
 static BOOL VolumeHudHidden(void) {
     id v = [Defaults() objectForKey:@"volumeHudHidden"];
     return v ? [v boolValue] : YES;
@@ -243,13 +243,13 @@ static BOOL VolumeHudHidden(void) {
     [modeBtn addTarget:self action:@selector(toggleVolumeMode) forControlEvents:UIControlEventTouchUpInside];
     [panel addSubview:modeBtn];
 
-    // 音量可视化开关行（控制音量条隐藏，默认开=隐藏音量条），位于【轨迹可视化】上方
+    // 隐藏音量条开关行（打开=隐藏音量条，关闭=显示音量条，默认开=隐藏），位于【轨迹可视化】上方
     UIView *hudRow = [[UIView alloc] initWithFrame:CGRectMake(16, 210, pw - 32, 46)];
     hudRow.layer.cornerRadius = 10;
     hudRow.backgroundColor = [UIColor colorWithWhite:0.93 alpha:1];
     [panel addSubview:hudRow];
     UILabel *hudLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 0, pw - 120, 46)];
-    hudLabel.text = @"音量可视化";
+    hudLabel.text = @"隐藏音量条";
     hudLabel.textColor = [UIColor darkGrayColor];
     hudLabel.font = [UIFont systemFontOfSize:16];
     [hudRow addSubview:hudLabel];
@@ -615,7 +615,7 @@ static BOOL VolumeHudHidden(void) {
     [d setObject:@(sw.on) forKey:@"volumeHudHidden"];
     [d synchronize];
     ApplyVolumeHudHidden(sw.on);
-    LogDVT(@"音量可视化(隐藏音量条) -> %@", sw.on ? @"隐藏" : @"显示");
+    LogDVT(@"隐藏音量条 -> %@", sw.on ? @"隐藏" : @"显示");
 }
 
 + (BOOL)isDebugEnabled {
@@ -1004,14 +1004,13 @@ static void SetSystemVolume(float v) {
     }
 }
 
-// 方案 B：把音量「钉死」在固定值。每次检测到音量变化（即用户按了音量键），
+// 方案 B：把音量「钉死」在固定值。每次检测到音量偏离 gPinnedVolume（即用户按了音量键），
 // 立即同步把音量设回 gPinnedVolume，既不漂移也不触底，HUD 不再闪烁/循环。
+// 回写判定不再依赖易竞态的全局 flag：回写时音量必等于 gPinnedVolume，故按 now 是否≈钉定值来区分。
 static float gPinnedVolume = 0.5f;   // 钉在中间，远离 0/1 两端，保证 + / - 都能产生可检测的变化
-static BOOL  gSettingVolume = NO;    // 防止「我们自己回写音量」触发 KVO 误判/死循环
 
-// 同步把音量钉回固定值（不延迟），用 gSettingVolume 屏蔽自身回写带来的 KVO 回调
+// 同步把音量钉回固定值（不延迟）
 static void PinVolume(void) {
-    gSettingVolume = YES;
     SetSystemVolume(gPinnedVolume);
 }
 
@@ -1023,16 +1022,16 @@ static void PinVolume(void) {
                         change:(NSDictionary<NSKeyValueChangeKey, id> *)change
                        context:(void *)context {
     if (![keyPath isEqualToString:@"outputVolume"]) return;
-    if (gSettingVolume) { gSettingVolume = NO; return; }   // 自身回写，忽略，避免死循环
-    NSNumber *oldN = change[NSKeyValueChangeOldKey];
     NSNumber *newN = change[NSKeyValueChangeNewKey];
-    if (!oldN || !newN) return;
-    float old = oldN.floatValue, now = newN.floatValue;
-    float delta = now - old;
-    if (fabsf(delta) < 0.0005f) return;   // 抖动过滤
+    if (!newN) return;
+    float now = newN.floatValue;
+    // 回写/稳态：我们把音量钉回 gPinnedVolume，回写时 now 恰好等于钉定值 → 忽略（无 flag 竞态，不会吞真实按键）
+    if (fabsf(now - gPinnedVolume) < 0.02f) return;
+    // 真实按键：now 偏离钉定值。delta 以钉定为基准，规避 old 被回写污染的竞态
+    float delta = now - gPinnedVolume;
     LogDVT(@"音量%@ delta=%+.2f 当前=%0.2f → 触发", delta > 0 ? @"+" : @"-", delta, now);
     TapPointsDebounced(delta);            // 用这次变化触发点击（+ / - 由 delta 符号决定）
-    PinVolume();                          // 立即同步钉回固定值（替代原 50ms 延迟复位，消除边界循环）
+    PinVolume();                          // 立即同步钉回固定值（消除边界循环，下一轮 now==gPinnedVolume 自动忽略）
 }
 - (void)volChanged:(NSNotification *)notif {
     // v1.0.1：已删除空壳实现（KVO 已负责，避免重复触发通道）
@@ -1085,7 +1084,7 @@ static void DirectTapInit(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         dispatch_async(dispatch_get_main_queue(), ^{
-            LogDVT(@"[DirectVolumeTap v1.0.9 已注入] 进程=%@ bundleID=%@",
+            LogDVT(@"[DirectVolumeTap v1.0.10 已注入] 进程=%@ bundleID=%@",
                    NSProcessInfo.processInfo.processName,
                    [[NSBundle mainBundle] bundleIdentifier]);
             gObs = [DirectVolumeObserver new];
