@@ -1,4 +1,4 @@
-// DirectVolumeTap v1.0.13 — 诊断版（v1.0.12 + 日志改写沙盒 Documents，移除无权限的固定路径/根目录）
+// DirectVolumeTap v1.0.14 — 诊断版（v1.0.13 + 修复音量复位 setVolumeTo:forCategory: + 去抖250→100ms + 连按合并补点击）
 // 不依赖任何设置页/配置：把 dylib 注入哪个 App，就在哪个 App 生效。
 //   ① 三指长按 → 弹出「菜单」：
 //        - 音量键设置（可点进去）：出现一红一绿两个大圆点，可自由拖动，
@@ -1032,13 +1032,26 @@ static void TapPoints(float delta) {
     });
 }
 
-// 去抖 250ms
+// 去抖窗口：仅合并「单次按键产生的重复 KVO」（通常 < 100ms），
+// 不再吞掉用户有意的快速连按（原 250ms 过激，翻页连按常被吞）
+static const double kTapDebounceSec = 0.10;
+// 单次音量键步长约 0.05；按 delta 估算被合并的按键次数，连按合并也能逐页翻（防被吞）
+static const float kVolumeStep = 0.05f;
 static CFAbsoluteTime gLastTap = 0;
 static void TapPointsDebounced(float delta) {
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (now - gLastTap < 0.25) { LogDVT(@"去抖：忽略本次触发"); return; }
+    if (now - gLastTap < kTapDebounceSec) { LogDVT(@"去抖：忽略本次触发"); return; }
     gLastTap = now;
-    TapPoints(delta);
+    // 滑动模式：一次触发一次回放即可
+    if ([[Defaults() objectForKey:@"mode"] isEqualToString:@"swipe"]) {
+        TapPoints(delta);
+        return;
+    }
+    // 点击模式：按 delta 估算按键次数，连按被合并成一次大跳变时也能每个按键翻一页
+    int n = (int)(fabsf(delta) / kVolumeStep + 0.5f);
+    if (n < 1) n = 1;
+    if (n > 8) n = 8;   // 防止极端跳变刷屏
+    for (int i = 0; i < n; i++) TapPoints(delta);
 }
 
 // 钉音量：MPVolumeView 抑制 HUD + AVSystemController 设回固定值（方案 B）
@@ -1073,9 +1086,30 @@ static void SetSystemVolume(float v) {
         LogDVT(@"MPVolumeView复位失败: %@", e);
     }
     @try {
+        // iOS 16.5 上单参数 setVolumeTo: 不存在（会抛 unrecognized selector），
+        // 正确私有 API 是 setVolumeTo:forCategory:，且 float 参数必须用 NSInvocation 正确传递。
         Class c = NSClassFromString(@"AVSystemController");
-        id controller = [c performSelector:NSSelectorFromString(@"sharedAVSystemController")];
-        [controller performSelector:NSSelectorFromString(@"setVolumeTo:") withObject:@(v)];
+        if (c) {
+            id controller = [c performSelector:NSSelectorFromString(@"sharedAVSystemController")];
+            SEL sel = NSSelectorFromString(@"setVolumeTo:forCategory:");
+            if (controller && [controller respondsToSelector:sel]) {
+                NSMethodSignature *sig = [controller methodSignatureForSelector:sel];
+                if (sig) {
+                    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                    [inv setSelector:sel];
+                    [inv setTarget:controller];
+                    float fv = v;
+                    [inv setArgument:&fv atIndex:2];
+                    NSString *cat = @"Audio/Video";
+                    [inv setArgument:&cat atIndex:3];
+                    [inv invoke];
+                } else {
+                    LogDVT(@"AVSystemController 无 setVolumeTo:forCategory: 签名");
+                }
+            } else {
+                LogDVT(@"AVSystemController 不支持 setVolumeTo:forCategory:");
+            }
+        }
     } @catch (NSException *e) {
         LogDVT(@"AVSystemController复位失败: %@", e);
     }
@@ -1170,7 +1204,7 @@ static void DirectTapInit(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         dispatch_async(dispatch_get_main_queue(), ^{
-            LogDVT(@"[DirectVolumeTap v1.0.13 诊断版 已注入] 进程=%@ bundleID=%@",
+            LogDVT(@"[DirectVolumeTap v1.0.14 诊断版 已注入] 进程=%@ bundleID=%@",
                    NSProcessInfo.processInfo.processName,
                    [[NSBundle mainBundle] bundleIdentifier]);
             gObs = [DirectVolumeObserver new];
