@@ -1090,7 +1090,7 @@ static void DirectTapInit(void) {
                 if (w) {
                     ApplyVolumeHudHidden(VolumeHudHidden());   // 窗口就绪后再挂载 MPVolumeView（修复冷启动 HUD 不隐藏）
                     [[AutoSkipSettingsCenter shared] installGestureInWindow:w];
-                } else 
+                }
             });
         });
     });
