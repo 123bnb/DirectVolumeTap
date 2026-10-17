@@ -43,6 +43,8 @@ CI（GitHub Actions）编译产出 `DirectVolumeTap.dylib`（arm64 + arm64e，ld
 
 写入 `/var/mobile/Library/Preferences/com.yourname.directvolumetap.log` 和 App 沙盒 `directvolumetap.log`，用 `cat` / Filza 查看触发、点击、复位记录。
 
+> **屏幕提醒**：dylib 注入 App 启动后，会在屏幕顶部浮出日志位置提示（自动换行，停留约 6 秒，比"请等待滑动完成"更久）。无论日志文件**已生成（●已有）**还是**尚未生成（○暂无）**都会提示，方便随时确认日志去哪儿找。
+
 ## 依赖
 
 - iOS 15+

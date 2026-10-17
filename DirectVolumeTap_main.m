@@ -1,4 +1,4 @@
-// DirectVolumeTap v1.0.11 — 诊断版（仅加取证日志，逻辑同 v1.0.10）
+// DirectVolumeTap v1.0.12 — 诊断版（v1.0.11 + 注入即提醒日志位置，存在/不存在均提示）
 // 不依赖任何设置页/配置：把 dylib 注入哪个 App，就在哪个 App 生效。
 //   ① 三指长按 → 弹出「菜单」：
 //        - 音量键设置（可点进去）：出现一红一绿两个大圆点，可自由拖动，
@@ -25,6 +25,7 @@ static BOOL DebugEnabled(void);        // 前向声明，定义见下方
 static UIWindow *FindKeyWindow(void);  // 前向声明，定义见下方（showDebugMarkerAtPoint 复用）
 static float DVTGetRate(void);         // 前向声明，定义见下方（openVolumeSettings 中设置滑块初值会先用到）
 static void ApplyVolumeHudHidden(BOOL hidden);  // 前向声明，定义见下方（菜单开关与启动时调用）
+static void ShowLogHint(void);                // 前向声明，定义见下方（注入时提醒日志位置，存在/不存在均提示）
 static NSString *LogPath1 = @"/var/mobile/Library/Preferences/com.yourname.directvolumetap.log";
 static void LogDVT(NSString *fmt, ...) {
     if (!DebugEnabled()) return;   // v1.0.1：调试开关关（默认）时不写盘、不 NSLog，零热路径开销
@@ -797,6 +798,69 @@ static void ShowToast(NSString *msg) {
                    dispatch_get_main_queue(), ^{ [l removeFromSuperview]; });
 }
 
+// v1.0.12：注入即提醒日志位置——无论日志是否已生成都提示，自动换行，时长比"请等待滑动完成"(1.5s) 更长。
+// 复用 FindKeyWindow，与 showBusyHint 同一悬浮风格（顶部黑底小字），但支持多行路径自动断行。
+static UIView *gLogHintBox = nil;
+static void ShowLogHint(void) {
+    UIWindow *w = FindKeyWindow();
+    if (!w) return;
+    if (gLogHintBox) { [gLogHintBox removeFromSuperview]; gLogHintBox = nil; }
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *p1 = LogPath1;                                   // 固定路径
+    NSString *p2 = nil;
+    @try { NSString *home = NSHomeDirectory(); if (home.length) p2 = [home stringByAppendingPathComponent:@"directvolumetap.log"]; } @catch (NSException *e) {}
+
+    // log 存在就提示「已有」，不存在也提示「暂无」——两种状态都提醒位置
+    BOOL e1 = [fm fileExistsAtPath:p1];
+    BOOL e2 = (p2 && [fm fileExistsAtPath:p2]);
+
+    NSString *mark1 = e1 ? @"●已有" : @"○暂无";
+    NSString *mark2 = e2 ? @"●已有" : @"○暂无";
+    NSMutableString *msg = [NSMutableString stringWithString:@"日志位置（已生成/未生成都会提示）：\n"];
+    [msg appendFormat:@"%@ %@\n", mark1, p1];
+    if (p2) [msg appendFormat:@"%@ %@\n", mark2, p2];
+
+    UIView *box = [[UIView alloc] init];
+    box.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.72];
+    box.layer.cornerRadius = 10;
+    box.layer.masksToBounds = YES;
+
+    UILabel *h = [[UILabel alloc] init];
+    h.text = msg;
+    h.textColor = [UIColor whiteColor];
+    h.textAlignment = NSTextAlignmentLeft;
+    h.font = [UIFont systemFontOfSize:12];
+    h.numberOfLines = 0;                          // 自动换行
+    h.lineBreakMode = NSLineBreakByCharWrapping;  // 路径无空格，按字符断行
+    [box addSubview:h];
+
+    CGFloat pad = 12;
+    CGFloat maxW = w.bounds.size.width - 40;      // 左右各留 20pt
+    CGFloat textW = maxW - pad*2;
+    CGSize textSize = [msg boundingRectWithSize:CGSizeMake(textW, CGFLOAT_MAX)
+                                       options:NSStringDrawingUsesLineFragmentOrigin | NSStringDrawingUsesFontLeading
+                                    attributes:@{NSFontAttributeName:h.font}
+                                       context:nil].size;
+    CGFloat textH = ceil(textSize.height);
+    h.frame = CGRectMake(pad, pad, textW, textH);
+
+    CGFloat topInset = 0;
+    if (@available(iOS 11.0, *)) topInset = w.safeAreaInsets.top;
+    CGFloat y = topInset + 44;                    // 状态栏/灵动岛下方
+    box.frame = CGRectMake(20, y, maxW, textH + pad*2);
+
+    [w addSubview:box];
+    [w bringSubviewToFront:box];
+    gLogHintBox = box;
+
+    // 时长：比"请等待滑动完成"(1.5s) 更长，给 6 秒
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (gLogHintBox == box) { [box removeFromSuperview]; gLogHintBox = nil; }
+    });
+}
+
 // v1.0.1：读滑动轨迹点（NSArray<[x,y,t]>）
 static NSArray *LoadSwipePts(NSString *key) {
     NSArray *a = [Defaults() arrayForKey:key];
@@ -1113,7 +1177,7 @@ static void DirectTapInit(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         dispatch_async(dispatch_get_main_queue(), ^{
-            LogDVT(@"[DirectVolumeTap v1.0.11 诊断版 已注入] 进程=%@ bundleID=%@",
+            LogDVT(@"[DirectVolumeTap v1.0.12 诊断版 已注入] 进程=%@ bundleID=%@",
                    NSProcessInfo.processInfo.processName,
                    [[NSBundle mainBundle] bundleIdentifier]);
             gObs = [DirectVolumeObserver new];
@@ -1137,6 +1201,7 @@ static void DirectTapInit(void) {
                 if (w) {
                     ApplyVolumeHudHidden(VolumeHudHidden());   // 窗口就绪后再挂载 MPVolumeView（修复冷启动 HUD 不隐藏）
                     [[AutoSkipSettingsCenter shared] installGestureInWindow:w];
+                    ShowLogHint();                            // v1.0.12：窗口就绪后提醒日志位置（存在/不存在均提示）
                 } else LogDVT(@"等待 UIApplication 就绪后装三指手势");
             });
         });
