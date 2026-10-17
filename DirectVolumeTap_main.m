@@ -1,4 +1,4 @@
-// DirectVolumeTap v1.0.8 — 独立版（自包含，注入即生效）
+// DirectVolumeTap v1.0.9 — 独立版（自包含，注入即生效）
 // 不依赖任何设置页/配置：把 dylib 注入哪个 App，就在哪个 App 生效。
 //   ① 三指长按 → 弹出「菜单」：
 //        - 音量键设置（可点进去）：出现一红一绿两个大圆点，可自由拖动，
@@ -965,7 +965,7 @@ static void TapPointsDebounced(float delta) {
     TapPoints(delta);
 }
 
-// 复位：到顶/底拉回中间 0.3（双保险 MPVolumeView + AVSystemController）
+// 钉音量：MPVolumeView 抑制 HUD + AVSystemController 设回固定值（方案 B）
 static MPVolumeView *gVolView = nil;
 // 应用「隐藏音量条」开关：隐藏→确保 MPVolumeView 挂载（抑制系统 HUD）；显示→移除 MPVolumeView（让系统 HUD 正常弹出）
 static void ApplyVolumeHudHidden(BOOL hidden) {
@@ -1004,17 +1004,15 @@ static void SetSystemVolume(float v) {
     }
 }
 
-static const float kResetVolume = 0.1f;   // 复位目标音量（改为 0.1）
-static const float kBoundHigh = 0.85f;
-static const float kBoundLow  = 0.05f;    // 触底阈值须低于复位目标0.1，避免复位后仍被判触底反复复位
-static BOOL VolumeNeedsReset(float v) { return (v > kBoundHigh || v < kBoundLow); }
+// 方案 B：把音量「钉死」在固定值。每次检测到音量变化（即用户按了音量键），
+// 立即同步把音量设回 gPinnedVolume，既不漂移也不触底，HUD 不再闪烁/循环。
+static float gPinnedVolume = 0.5f;   // 钉在中间，远离 0/1 两端，保证 + / - 都能产生可检测的变化
+static BOOL  gSettingVolume = NO;    // 防止「我们自己回写音量」触发 KVO 误判/死循环
 
-static void DoReset(float oldVol, float nowVol) {
-    if (VolumeNeedsReset(nowVol) || VolumeNeedsReset(oldVol)) {
-        LogDVT(@"音量接近边界(%.2f→%.2f)，复位到 %.1f", oldVol, nowVol, kResetVolume);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ SetSystemVolume(kResetVolume); });
-    }
+// 同步把音量钉回固定值（不延迟），用 gSettingVolume 屏蔽自身回写带来的 KVO 回调
+static void PinVolume(void) {
+    gSettingVolume = YES;
+    SetSystemVolume(gPinnedVolume);
 }
 
 // 监听
@@ -1025,58 +1023,26 @@ static void DoReset(float oldVol, float nowVol) {
                         change:(NSDictionary<NSKeyValueChangeKey, id> *)change
                        context:(void *)context {
     if (![keyPath isEqualToString:@"outputVolume"]) return;
+    if (gSettingVolume) { gSettingVolume = NO; return; }   // 自身回写，忽略，避免死循环
     NSNumber *oldN = change[NSKeyValueChangeOldKey];
     NSNumber *newN = change[NSKeyValueChangeNewKey];
     if (!oldN || !newN) return;
     float old = oldN.floatValue, now = newN.floatValue;
     float delta = now - old;
-    if (fabsf(delta) < 0.0005f) return;
-    // 插件复位副作用识别：旧值在边界外(触顶/触底)、新值≈复位目标0.3，
-    // 说明这是插件把音量拉回中间造成的，不是用户按键，不触发点击。
-    // 真实按键单次只变一小档，不可能从边界外一下跳到0.3，故不会误伤真实操作。
-    if (VolumeNeedsReset(old) && fabsf(now - kResetVolume) < 0.05f) {
-        LogDVT(@"复位副作用(%.2f→%.2f)，不触发点击", old, now);
-        return;
-    }
+    if (fabsf(delta) < 0.0005f) return;   // 抖动过滤
     LogDVT(@"音量%@ delta=%+.2f 当前=%0.2f → 触发", delta > 0 ? @"+" : @"-", delta, now);
-    TapPointsDebounced(delta);
-    DoReset(old, now);
+    TapPointsDebounced(delta);            // 用这次变化触发点击（+ / - 由 delta 符号决定）
+    PinVolume();                          // 立即同步钉回固定值（替代原 50ms 延迟复位，消除边界循环）
 }
 - (void)volChanged:(NSNotification *)notif {
     // v1.0.1：已删除空壳实现（KVO 已负责，避免重复触发通道）
 }
 @end
 
-// 第三重：hook UIApplication _handleKeyUIEvent: 捕获音量键
-static IMP gOrigHandleKeyUIEvent = NULL;
-static void dvtHandleKeyUIEvent(id self, SEL _cmd, id event) {
-    @try {
-        UIEvent *ev = (UIEvent *)event;
-        long keyCode = [[ev valueForKey:@"keyCode"] longValue];
-        if (keyCode == 0xE8 || keyCode == 0xE9) {
-            if (VolumeHudHidden()) {
-                LogDVT(@"★捕获音量键 keyCode=0x%lX（已拦截，不转发系统，HUD 不弹出）", keyCode);
-                TapPointsDebounced((keyCode == 0xE9) ? 0.05f : -0.05f);
-                return;   // 吞掉按键事件：系统收不到按键 → 音量不变 → 系统音量条(HUD)不再弹出
-            }
-            // 不隐藏音量条：交还系统处理（HUD 正常弹出），映射改由 KVO outputVolume 触发
-            LogDVT(@"★捕获音量键 keyCode=0x%lX（不拦截，HUD 弹出）", keyCode);
-        }
-    } @catch (NSException *e) {
-        LogDVT(@"key event hook 异常: %@", e);
-    }
-    if (gOrigHandleKeyUIEvent) {
-        ((void(*)(id, SEL, id))gOrigHandleKeyUIEvent)(self, _cmd, event);
-    }
-}
-
-static void InstallKeyHook(void) {
-    Method m = class_getInstanceMethod([UIApplication class], sel_registerName("_handleKeyUIEvent:"));
-    if (!m) { LogDVT(@"hook失败: 无 _handleKeyUIEvent:"); return; }
-    gOrigHandleKeyUIEvent = method_getImplementation(m);
-    method_setImplementation(m, (IMP)dvtHandleKeyUIEvent);
-    LogDVT(@"已 hook _handleKeyUIEvent: 捕获音量键");
-}
+// 注：已移除方案 A（hook UIApplication _handleKeyUIEvent: 吞音量键）。
+// 非越狱注入环境下，系统音量由 SpringBoard/音频守护进程在 App 进程外改写，
+// UIKit 事件层处于下游，吞键无法阻止系统音量变化；且该 hook 的 keyCode 取不到值实际为空转。
+// 现统一走方案 B：KVO 检测变化 + 同步钉回固定音量 + MPVolumeView 抑制 HUD。
 
 // 关键：保持音频会话活跃（KVO outputVolume 才触发）
 static AVAudioEngine *gEngine = nil;
@@ -1119,7 +1085,7 @@ static void DirectTapInit(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         dispatch_async(dispatch_get_main_queue(), ^{
-            LogDVT(@"[DirectVolumeTap v1.0.1 已注入] 进程=%@ bundleID=%@",
+            LogDVT(@"[DirectVolumeTap v1.0.9 已注入] 进程=%@ bundleID=%@",
                    NSProcessInfo.processInfo.processName,
                    [[NSBundle mainBundle] bundleIdentifier]);
             gObs = [DirectVolumeObserver new];
@@ -1129,20 +1095,21 @@ static void DirectTapInit(void) {
                                                  context:NULL];
             // v1.0.1：删除系统通知观察者注册（volChanged: 空壳，KVO 已负责，避免重复触发通道）
             LogDVT(@"已监听音量 (KVO) 当前=%0.2f", [AVAudioSession sharedInstance].outputVolume);
-            InstallKeyHook();
             KeepAudioSessionActive();
-            ApplyVolumeHudHidden(VolumeHudHidden());   // 按开关决定 MPVolumeView 是否挂载（控制系统音量条 HUD）
+            ApplyVolumeHudHidden(VolumeHudHidden());   // 先尝试挂载（窗口可能尚未就绪，下面 1s 后会再挂载一次）
             float bootVol = [AVAudioSession sharedInstance].outputVolume;
-            if (VolumeNeedsReset(bootVol)) {
-                LogDVT(@"启动时音量=%.2f 已在边界，复位到 %.1f", bootVol, kResetVolume);
-                SetSystemVolume(kResetVolume);
+            if (fabsf(bootVol - gPinnedVolume) > 0.02f) {
+                LogDVT(@"启动音量=%.2f，钉回 %.1f", bootVol, gPinnedVolume);
+                PinVolume();
             }
             [[AutoSkipSettingsCenter shared] loadPoints];
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 UIWindow *w = [UIApplication sharedApplication].keyWindow;
-                if (w) [[AutoSkipSettingsCenter shared] installGestureInWindow:w];
-                else LogDVT(@"等待 UIApplication 就绪后装三指手势");
+                if (w) {
+                    ApplyVolumeHudHidden(VolumeHudHidden());   // 窗口就绪后再挂载 MPVolumeView（修复冷启动 HUD 不隐藏）
+                    [[AutoSkipSettingsCenter shared] installGestureInWindow:w];
+                } else LogDVT(@"等待 UIApplication 就绪后装三指手势");
             });
         });
     });
