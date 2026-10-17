@@ -1,4 +1,4 @@
-// DirectVolumeTap v1.0.14 — 诊断版（v1.0.13 + 修复音量复位 setVolumeTo:forCategory: + 去抖250→100ms + 连按合并补点击）
+// DirectVolumeTap v1.0.15 — 移除全部日志/诊断输出（LogDVT / DiagLog / ShowLogHint / DVTLogPath 及屏幕日志位置提醒），仅保留音量键翻页核心功能
 // 不依赖任何设置页/配置：把 dylib 注入哪个 App，就在哪个 App 生效。
 //   ① 三指长按 → 弹出「菜单」：
 //        - 音量键设置（可点进去）：出现一红一绿两个大圆点，可自由拖动，
@@ -25,43 +25,6 @@ static BOOL DebugEnabled(void);        // 前向声明，定义见下方
 static UIWindow *FindKeyWindow(void);  // 前向声明，定义见下方（showDebugMarkerAtPoint 复用）
 static float DVTGetRate(void);         // 前向声明，定义见下方（openVolumeSettings 中设置滑块初值会先用到）
 static void ApplyVolumeHudHidden(BOOL hidden);  // 前向声明，定义见下方（菜单开关与启动时调用）
-static void ShowLogHint(void);                // 前向声明，定义见下方（注入时提醒日志位置，存在/不存在均提示）
-// v1.0.13：日志只写沙盒 Documents（固定路径 /var/mobile/... 与沙盒根目录均无权限，已移除）
-static NSString *DVTLogPath(void) {
-    @try {
-        NSArray *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-        NSString *docDir = docs.firstObject;
-        if (docDir.length) return [docDir stringByAppendingPathComponent:@"directvolumetap.log"];
-    } @catch (NSException *e) {}
-    return nil;
-}
-static void LogDVT(NSString *fmt, ...) {
-    if (!DebugEnabled()) return;   // v1.0.1：调试开关关（默认）时不写盘、不 NSLog，零热路径开销
-    va_list ap; va_start(ap, fmt);
-    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
-    va_end(ap);
-    NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], s];
-    NSString *p = DVTLogPath();
-    if (p.length) {
-        FILE *f = fopen(p.UTF8String, "a");
-        if (f) { fputs(line.UTF8String, f); fclose(f); }
-    }
-    NSLog(@"%@", line);
-}
-
-// 诊断版专用：无条件输出（不依赖调试开关），复用写盘 + NSLog。正式版将移除。
-static void DiagLog(NSString *fmt, ...) {
-    va_list ap; va_start(ap, fmt);
-    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
-    va_end(ap);
-    NSString *line = [NSString stringWithFormat:@"[DIAG] %@ %@\n", [NSDate date], s];
-    NSString *p = DVTLogPath();
-    if (p.length) {
-        FILE *f = fopen(p.UTF8String, "a");
-        if (f) { fputs(line.UTF8String, f); fclose(f); }
-    }
-    NSLog(@"%@", line);
-}
 
 // ---------- NSUserDefaults（独立 suite，不与 VolumeKeyTapper 混） ----------
 static NSUserDefaults *Defaults(void) {
@@ -156,15 +119,8 @@ static BOOL VolumeHudHidden(void) {
             // 上方绿点 = 音量+ ；下方红点 = 音量-
             [self.points addObject:[NSValue valueWithCGPoint:CGPointMake(cx, scr.height * 0.30)]];
             [self.points addObject:[NSValue valueWithCGPoint:CGPointMake(cx, scr.height * 0.70)]];
-            LogDVT(@"未保存坐标，使用默认: +=(%.0f,%.0f) -=(%.0f,%.0f)",
-                   cx, scr.height*0.30, cx, scr.height*0.70);
         }
     } else {
-        LogDVT(@"加载坐标: +=(%.0f,%.0f) -=(%.0f,%.0f)",
-               self.points.count>0 ? self.points[0].CGPointValue.x : -1,
-               self.points.count>0 ? self.points[0].CGPointValue.y : -1,
-               self.points.count>1 ? self.points[1].CGPointValue.x : -1,
-               self.points.count>1 ? self.points[1].CGPointValue.y : -1);
     }
 }
 
@@ -182,7 +138,6 @@ static BOOL VolumeHudHidden(void) {
         [d setInteger:(NSInteger)p.y forKey:@"yMinus"];
     }
     [d synchronize];
-    LogDVT(@"已保存坐标 %lu 个点", (unsigned long)self.points.count);
 }
 
 // ---------- 三指长按 → 菜单 ----------
@@ -193,18 +148,16 @@ static BOOL VolumeHudHidden(void) {
     gr.numberOfTouchesRequired = 3;
     gr.minimumPressDuration = 0.5;
     [window addGestureRecognizer:gr];
-    LogDVT(@"三指长按手势已安装");
 }
 
 - (void)onThreeFingerTap:(UIGestureRecognizer *)gr {
     if (gr.state != UIGestureRecognizerStateBegan) return;
     UIWindow *w = gr.view.window ?: [UIApplication sharedApplication].keyWindow;
-    LogDVT(@"三指手势触发 → 显示菜单");
     [self showMenuInWindow:w];
 }
 
 - (void)showMenuInWindow:(UIWindow *)window {
-    if (!window) { LogDVT(@"菜单失败: 无窗口"); return; }
+    if (!window) {  return; }
     [self closeMenu];
     [self closeVolumeSettings];
 
@@ -326,7 +279,6 @@ static BOOL VolumeHudHidden(void) {
     [panel addSubview:modeEntry];
 
     [window addSubview:mv];
-    LogDVT(@"菜单已显示");
 }
 
 - (void)closeMenu {
@@ -343,7 +295,7 @@ static BOOL VolumeHudHidden(void) {
 - (void)openVolumeSettings {
     [self closeMenu];
     UIWindow *window = [UIApplication sharedApplication].keyWindow;
-    if (!window) { LogDVT(@"设置失败: 无 keyWindow"); return; }
+    if (!window) {  return; }
 
     UIView *ov = [[UIView alloc] initWithFrame:window.bounds];
     ov.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.4];
@@ -380,14 +332,13 @@ static BOOL VolumeHudHidden(void) {
     [ov addSubview:save];
 
     [self refreshMarkers];
-    LogDVT(@"点击模式子界面已显示");
 }
 
 // ======== v1.0.1 滑动模式（抄袭 PageTurnerDylib 的【滑动(手动)】，完美复原真实滑动） ========
 - (void)openSwipeModeSettings {
     [self closeMenu];
     UIWindow *window = FindKeyWindow();
-    if (!window) { LogDVT(@"滑动模式设置失败: 无 keyWindow"); return; }
+    if (!window) {  return; }
     [self loadSwipes];
     self.swipeLayers = [NSMutableArray array];
 
@@ -431,7 +382,6 @@ static BOOL VolumeHudHidden(void) {
     [ov addGestureRecognizer:pan];
 
     [self drawSwipeTrails];
-    LogDVT(@"滑动模式子界面已显示");
 }
 
 - (void)onSwipePan:(UIPanGestureRecognizer *)pan {
@@ -460,7 +410,6 @@ static BOOL VolumeHudHidden(void) {
         self.recordStage++;
         self.currentRecording = nil;
         [self drawSwipeTrails];
-        LogDVT(@"滑动录制完成 stage=%ld 点数=%lu", (long)(self.recordStage - 1), (unsigned long)self.swipePlusPts.count + self.swipeMinusPts.count);
     }
 }
 
@@ -500,7 +449,6 @@ static BOOL VolumeHudHidden(void) {
     self.currentRecording = nil;
     self.recordStage = 0;
     [self drawSwipeTrails];
-    LogDVT(@"滑动轨迹已复位，可重新录制");
 }
 
 - (void)onSwipeDone {
@@ -516,7 +464,6 @@ static BOOL VolumeHudHidden(void) {
     [Defaults() synchronize];
     UILabel *lbl = (UILabel *)[s.superview viewWithTag:9911];
     if (lbl) lbl.text = [NSString stringWithFormat:@"x%.1f", r];
-    LogDVT(@"回放速率 -> x%.1f", r);
 }
 
 - (void)saveSwipes {
@@ -524,7 +471,6 @@ static BOOL VolumeHudHidden(void) {
     [d setObject:(self.swipePlusPts ?: @[]) forKey:@"swipePlus"];
     [d setObject:(self.swipeMinusPts ?: @[]) forKey:@"swipeMinus"];
     [d synchronize];
-    LogDVT(@"已保存滑动轨迹 +:%lu -:%lu", (unsigned long)self.swipePlusPts.count, (unsigned long)self.swipeMinusPts.count);
 }
 
 - (void)loadSwipes {
@@ -539,7 +485,6 @@ static BOOL VolumeHudHidden(void) {
     NSString *cur = [[Defaults() objectForKey:@"mode"] description];
     [Defaults() setObject:([cur isEqualToString:@"swipe"] ? @"tap" : @"swipe") forKey:@"mode"];
     [Defaults() synchronize];
-    LogDVT(@"音量键模式切换 -> %@", [cur isEqualToString:@"swipe"] ? @"点击模式" : @"滑动模式");
     [self closeMenu];
     [self showMenuInWindow:[UIApplication sharedApplication].keyWindow];
 }
@@ -565,7 +510,6 @@ static BOOL VolumeHudHidden(void) {
         self.points[1] = [NSValue valueWithCGPoint:CGPointMake(cx, scr.height * 0.70)];
     }
     [self refreshMarkers];
-    LogDVT(@"已复位圆点到初始位置");
 }
 
 // 画大圆点：index0=绿+（上） index1=红-（下），可拖动
@@ -599,7 +543,6 @@ static BOOL VolumeHudHidden(void) {
 
         [self.overlay addSubview:dot];
         [self.dotViews addObject:dot];
-        LogDVT(@"圆点%d 位于 (%.0f,%.0f)", (int)i, p.x, p.y);
     }
 }
 
@@ -616,7 +559,6 @@ static BOOL VolumeHudHidden(void) {
         [pan setTranslation:CGPointZero inView:self.overlay];
         self.points[idx] = [NSValue valueWithCGPoint:newCenter];
     } else if (pan.state == UIGestureRecognizerStateEnded) {
-        LogDVT(@"圆点%d 最终位置 (%.0f,%.0f)", (int)idx, pan.view.center.x, pan.view.center.y);
     }
 }
 
@@ -625,7 +567,6 @@ static BOOL VolumeHudHidden(void) {
     NSUserDefaults *d = Defaults();
     [d setBool:sw.on forKey:@"debugEnabled"];
     [d synchronize];
-    LogDVT(@"轨迹可视化 -> %@", sw.on ? @"开" : @"关");
 }
 
 - (void)onVolumeHudSwitchChanged:(UISwitch *)sw {
@@ -633,7 +574,6 @@ static BOOL VolumeHudHidden(void) {
     [d setObject:@(sw.on) forKey:@"volumeHudHidden"];
     [d synchronize];
     ApplyVolumeHudHidden(sw.on);
-    LogDVT(@"隐藏音量条 -> %@", sw.on ? @"隐藏" : @"显示");
 }
 
 + (BOOL)isDebugEnabled {
@@ -796,63 +736,6 @@ static void ShowToast(NSString *msg) {
                    dispatch_get_main_queue(), ^{ [l removeFromSuperview]; });
 }
 
-// v1.0.12：注入即提醒日志位置——无论日志是否已生成都提示，自动换行，时长比"请等待滑动完成"(1.5s) 更长。
-// 复用 FindKeyWindow，与 showBusyHint 同一悬浮风格（顶部黑底小字），但支持多行路径自动断行。
-static UIView *gLogHintBox = nil;
-static void ShowLogHint(void) {
-    UIWindow *w = FindKeyWindow();
-    if (!w) return;
-    if (gLogHintBox) { [gLogHintBox removeFromSuperview]; gLogHintBox = nil; }
-
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *logPath = DVTLogPath();                           // 沙盒 Documents 内
-    BOOL exists = (logPath.length && [fm fileExistsAtPath:logPath]);
-
-    // log 存在就提示「已有」，不存在也提示「暂无」——两种状态都提醒位置
-    NSString *mark = exists ? @"●已有" : @"○暂无";
-    NSMutableString *msg = [NSMutableString stringWithString:@"日志位置（已生成/未生成都会提示）：\n"];
-    if (logPath.length) [msg appendFormat:@"%@ %@\n", mark, logPath];
-    else [msg appendString:@"○暂无 沙盒 Documents 暂不可访问\n"];
-
-    UIView *box = [[UIView alloc] init];
-    box.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.72];
-    box.layer.cornerRadius = 10;
-    box.layer.masksToBounds = YES;
-
-    UILabel *h = [[UILabel alloc] init];
-    h.text = msg;
-    h.textColor = [UIColor whiteColor];
-    h.textAlignment = NSTextAlignmentLeft;
-    h.font = [UIFont systemFontOfSize:12];
-    h.numberOfLines = 0;                          // 自动换行
-    h.lineBreakMode = NSLineBreakByCharWrapping;  // 路径无空格，按字符断行
-    [box addSubview:h];
-
-    CGFloat pad = 12;
-    CGFloat maxW = w.bounds.size.width - 40;      // 左右各留 20pt
-    CGFloat textW = maxW - pad*2;
-    CGSize textSize = [msg boundingRectWithSize:CGSizeMake(textW, CGFLOAT_MAX)
-                                       options:NSStringDrawingUsesLineFragmentOrigin | NSStringDrawingUsesFontLeading
-                                    attributes:@{NSFontAttributeName:h.font}
-                                       context:nil].size;
-    CGFloat textH = ceil(textSize.height);
-    h.frame = CGRectMake(pad, pad, textW, textH);
-
-    CGFloat topInset = 0;
-    if (@available(iOS 11.0, *)) topInset = w.safeAreaInsets.top;
-    CGFloat y = topInset + 44;                    // 状态栏/灵动岛下方
-    box.frame = CGRectMake(20, y, maxW, textH + pad*2);
-
-    [w addSubview:box];
-    [w bringSubviewToFront:box];
-    gLogHintBox = box;
-
-    // 时长：比"请等待滑动完成"(1.5s) 更长，给 6 秒
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (gLogHintBox == box) { [box removeFromSuperview]; gLogHintBox = nil; }
-    });
-}
 
 // v1.0.1：读滑动轨迹点（NSArray<[x,y,t]>）
 static NSArray *LoadSwipePts(NSString *key) {
@@ -896,7 +779,6 @@ static void dvtFinishSwipe(void) {
     gSwipeProxy = nil;
     if (gSwipeWatchdog) { dispatch_block_cancel(gSwipeWatchdog); gSwipeWatchdog = nil; }
     gSwipeRunning = NO;
-    LogDVT(@"滑动回放收尾（强制重置状态）");
 }
 
 // 按时间线性插值取坐标（二分定位区间）
@@ -1001,7 +883,6 @@ static void TapPoints(float delta) {
         }
         NSArray *pts = isPlus ? LoadSwipePts(@"swipePlus") : LoadSwipePts(@"swipeMinus");
         if (pts.count < 2) {
-            LogDVT(@"滑动模式：%@ 未录制轨迹（三指长按→滑动模式设置）", isPlus ? @"音量+" : @"音量-");
             ShowToast([NSString stringWithFormat:@"滑动模式未录制%@轨迹", isPlus ? @"音量+" : @"音量-"]);
             return;
         }
@@ -1013,18 +894,16 @@ static void TapPoints(float delta) {
     // 点击模式（原逻辑不变）
     CGPoint p = isPlus ? [AutoSkipSettingsCenter pointForPlus] : [AutoSkipSettingsCenter pointForMinus];
     if (p.x == NSNotFound || p.y == NSNotFound) {
-        LogDVT(@"音量%@：无对应坐标（请三指长按→点击模式设置）", isPlus ? @"+" : @"-");
         ShowToast([NSString stringWithFormat:@"音量%@ 未设坐标，三指长按设置", isPlus ? @"+" : @"-"]);
         return;
     }
     UIWindow *w = FindKeyWindow();
-    if (!w) { LogDVT(@"音量触发：无 keyWindow"); return; }
+    if (!w) {  return; }
     // 同样保证 fakeTouchId 在主线程（音量监听 KVO 可能在非主线程回调）
     dispatch_async(dispatch_get_main_queue(), ^{
         NSInteger pid = [PTFakeMetaTouch fakeTouchId:1 AtPoint:p withTouchPhase:UITouchPhaseBegan];
         usleep(30000);
         [PTFakeMetaTouch fakeTouchId:pid AtPoint:p withTouchPhase:UITouchPhaseEnded];
-        LogDVT(@"音量%@→点击 (%d, %d) pointId=%ld", isPlus ? @"+" : @"-", (int)p.x, (int)p.y, (long)pid);
         // 调试开关打开时才显示点击轨迹；关闭则完全隐形
         if ([AutoSkipSettingsCenter isDebugEnabled]) {
             [AutoSkipSettingsCenter showDebugMarkerAtPoint:p isPlus:isPlus];
@@ -1040,7 +919,7 @@ static const float kVolumeStep = 0.05f;
 static CFAbsoluteTime gLastTap = 0;
 static void TapPointsDebounced(float delta) {
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (now - gLastTap < kTapDebounceSec) { LogDVT(@"去抖：忽略本次触发"); return; }
+    if (now - gLastTap < kTapDebounceSec) {  return; }
     gLastTap = now;
     // 滑动模式：一次触发一次回放即可
     if ([[Defaults() objectForKey:@"mode"] isEqualToString:@"swipe"]) {
@@ -1069,7 +948,6 @@ static void ApplyVolumeHudHidden(BOOL hidden) {
     }
 }
 static void SetSystemVolume(float v) {
-    DiagLog(@"SetSystemVolume -> target v=%.4f", v);
     @try {
         if (!gVolView && VolumeHudHidden()) {
             gVolView = [[MPVolumeView alloc] initWithFrame:CGRectMake(-2000, -2000, 0, 0)];
@@ -1083,7 +961,6 @@ static void SetSystemVolume(float v) {
             }
         }
     } @catch (NSException *e) {
-        LogDVT(@"MPVolumeView复位失败: %@", e);
     }
     @try {
         // iOS 16.5 上单参数 setVolumeTo: 不存在（会抛 unrecognized selector），
@@ -1104,14 +981,11 @@ static void SetSystemVolume(float v) {
                     [inv setArgument:&cat atIndex:3];
                     [inv invoke];
                 } else {
-                    LogDVT(@"AVSystemController 无 setVolumeTo:forCategory: 签名");
                 }
             } else {
-                LogDVT(@"AVSystemController 不支持 setVolumeTo:forCategory:");
             }
         }
     } @catch (NSException *e) {
-        LogDVT(@"AVSystemController复位失败: %@", e);
     }
 }
 
@@ -1140,16 +1014,12 @@ static void PinVolume(void) {
     float old = oldN ? oldN.floatValue : -1.0f;
     float diff = fabsf(now - gPinnedVolume);
     float rawDelta = oldN ? (now - old) : 0.0f;
-    DiagLog(@"KVO enter: now=%.4f old=%.4f pinned=%.4f |now-pin|=%.4f rawDelta(old→now)=%.4f",
-            now, old, gPinnedVolume, diff, rawDelta);
     // 回写/稳态：我们把音量钉回 gPinnedVolume，回写时 now 恰好等于钉定值 → 忽略（无 flag 竞态，不会吞真实按键）
     if (diff < 0.02f) {
-        DiagLog(@"  -> IGNORED (判定为回写/稳态, |now-pin|<0.02)");
         return;
     }
     // 真实按键：now 偏离钉定值。delta 以钉定为基准，规避 old 被回写污染的竞态
     float delta = now - gPinnedVolume;
-    DiagLog(@"  -> TRIGGER dir=%@ delta(对pin)=%.4f rawDelta=%+.4f", delta > 0 ? @"+" : @"-", delta, rawDelta);
     TapPointsDebounced(delta);            // 用这次变化触发点击（+ / - 由 delta 符号决定）
     PinVolume();                          // 立即同步钉回固定值（消除边界循环，下一轮 now==gPinnedVolume 自动忽略）
 }
@@ -1169,10 +1039,9 @@ static void KeepAudioSessionActive(void) {
     NSError *err = nil;
     AVAudioSession *session = [AVAudioSession sharedInstance];
     [session setCategory:AVAudioSessionCategoryAmbient error:&err];
-    if (err) LogDVT(@"setCategory Ambient 失败: %@", err);
+    if (err) 
     [session setActive:YES error:&err];
-    if (err) LogDVT(@"setActive 失败: %@", err);
-    LogDVT(@"音频会话已激活，当前音量=%0.2f", session.outputVolume);
+    if (err) 
     @try {
         gEngine = [AVAudioEngine new];
         AVAudioPlayerNode *player = [AVAudioPlayerNode new];
@@ -1186,11 +1055,9 @@ static void KeepAudioSessionActive(void) {
         buf.frameLength = 44100;
         [player scheduleBuffer:buf atTime:nil options:AVAudioPlayerNodeBufferLoops completionHandler:nil];
         [gEngine startAndReturnError:&err];
-        if (err) LogDVT(@"静音引擎启动失败: %@", err);
+        if (err) 
         [player play];
-        LogDVT(@"静音循环已启动，音频会话保持活跃");
     } @catch (NSException *e) {
-        LogDVT(@"静音引擎异常: %@", e);
     }
 }
 
@@ -1204,21 +1071,16 @@ static void DirectTapInit(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         dispatch_async(dispatch_get_main_queue(), ^{
-            LogDVT(@"[DirectVolumeTap v1.0.14 诊断版 已注入] 进程=%@ bundleID=%@",
-                   NSProcessInfo.processInfo.processName,
-                   [[NSBundle mainBundle] bundleIdentifier]);
             gObs = [DirectVolumeObserver new];
             [[AVAudioSession sharedInstance] addObserver:gObs
                                               forKeyPath:@"outputVolume"
                                                  options:NSKeyValueObservingOptionOld | NSKeyValueObservingOptionNew
                                                  context:NULL];
             // v1.0.1：删除系统通知观察者注册（volChanged: 空壳，KVO 已负责，避免重复触发通道）
-            LogDVT(@"已监听音量 (KVO) 当前=%0.2f", [AVAudioSession sharedInstance].outputVolume);
             KeepAudioSessionActive();
             ApplyVolumeHudHidden(VolumeHudHidden());   // 先尝试挂载（窗口可能尚未就绪，下面 1s 后会再挂载一次）
             float bootVol = [AVAudioSession sharedInstance].outputVolume;
             if (fabsf(bootVol - gPinnedVolume) > 0.02f) {
-                LogDVT(@"启动音量=%.2f，钉回 %.1f", bootVol, gPinnedVolume);
                 PinVolume();
             }
             [[AutoSkipSettingsCenter shared] loadPoints];
@@ -1228,8 +1090,7 @@ static void DirectTapInit(void) {
                 if (w) {
                     ApplyVolumeHudHidden(VolumeHudHidden());   // 窗口就绪后再挂载 MPVolumeView（修复冷启动 HUD 不隐藏）
                     [[AutoSkipSettingsCenter shared] installGestureInWindow:w];
-                    ShowLogHint();                            // v1.0.12：窗口就绪后提醒日志位置（存在/不存在均提示）
-                } else LogDVT(@"等待 UIApplication 就绪后装三指手势");
+                } else 
             });
         });
     });
