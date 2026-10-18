@@ -13,7 +13,7 @@
 
 #import "ptftouch/PTFakeMetaTouch.h"
 #import <AVFoundation/AVFoundation.h>
-#import <AVFAudio/AVFAudioEngine.h>
+#import <AVFAudio/AVAudioEngine.h>
 #import <MediaPlayer/MediaPlayer.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
@@ -660,87 +660,6 @@ static BOOL VolumeHudHidden(void) {
     lb.textColor = [UIColor whiteColor];
     lb.textAlignment = NSTextAlignmentCenter;
     lb.font = [UIFont boldSystemFontOfSize:30];
-    [dot addSubview:lb];
-
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onDotPan:)];
-    [dot addGestureRecognizer:pan];
-
-    [self.overlay addSubview:dot];
-    [self.dotViews addObject:dot];
-    }
-}
-
-// 拖动圆点 → 更新坐标
-- (void)onDotPan:(UIPanGestureRecognizer *)pan {
-    if (!pan.view) return;
-    NSUInteger idx = [self.dotViews indexOfObject:pan.view];
-    if (idx == NSNotFound || idx >= self.points.count) return;
-    if (pan.state == UIGestureRecognizerStateBegan || pan.state == UIGestureRecognizerStateChanged) {
-        CGPoint trans = [pan translationInView:self.overlay];
-        CGPoint center = pan.view.center;
-        CGPoint newCenter = CGPointMake(center.x + trans.x, center.y + trans.y);
-        pan.view.center = newCenter;
-        [pan setTranslation:CGPointZero inView:self.overlay];
-        self.points[idx] = [NSValue valueWithCGPoint:newCenter];
-    } else if (pan.state == UIGestureRecognizerStateEnded) {
-    }
-}
-
-// ---------- 调试开关 ----------
-- (void)onDebugSwitchChanged:(UISwitch *)sw {
-    NSUserDefaults *d = Defaults();
-    [d setBool:sw.on forKey:@"debugEnabled"];
-    [d synchronize];
-}
-
-- (void)onVolumeHudSwitchChanged:(UISwitch *)sw {
-    NSUserDefaults *d = Defaults();
-    [d setObject:@(sw.on) forKey:@"volumeHudHidden"];
-    [d synchronize];
-    ApplyVolumeHudHidden(sw.on);
-}
-
-+ (BOOL)isDebugEnabled {
-    return DebugEnabled();
-}
-
-// ---------- 坐标访问（供触发模块读取） ----------
-+ (CGPoint)pointForPlus {
-    AutoSkipSettingsCenter *c = [AutoSkipSettingsCenter shared];
-    if (c.points.count > 0) return c.points[0].CGPointValue;
-    return CGPointMake(NSNotFound, NSNotFound);
-}
-+ (CGPoint)pointForMinus {
-    AutoSkipSettingsCenter *c = [AutoSkipSettingsCenter shared];
-    if (c.points.count > 1) return c.points[1].CGPointValue;
-    return CGPointMake(NSNotFound, NSNotFound);
-}
-
-// 调试轨迹：在点击位置显示对应颜色的大圆点，短暂停留后消失
-// 关键：marker 必须 userInteractionEnabled=NO（触摸穿透，不拦截下层 App 的点击，
-//       否则模拟触摸会点到自己身上导致无法连续点触）；并复用单个 marker，
-//       避免同位置多次点击叠加变实。
-+ (void)showDebugMarkerAtPoint:(CGPoint)p isPlus:(BOOL)isPlus {
-    static UIView *gDebugMarker = nil;   // 复用一个 marker，防止叠加
-    if (gDebugMarker) { [gDebugMarker removeFromSuperview]; gDebugMarker = nil; }
-
-    UIWindow *w = FindKeyWindow();   // v1.0.1：复用下方 FindKeyWindow，去重复
-    if (!w) return;
-
-    CGFloat d = 66.0;
-    UIView *marker = [[UIView alloc] initWithFrame:CGRectMake(p.x - d/2, p.y - d/2, d, d)];
-    marker.backgroundColor = isPlus ? [UIColor systemGreenColor] : [UIColor systemRedColor];
-    marker.layer.cornerRadius = d/2;
-    marker.layer.masksToBounds = YES;
-    marker.alpha = 0.8;
-    marker.layer.borderWidth = 3;
-    marker.layer.borderColor = [UIColor whiteColor].CGColor;
-    marker.userInteractionEnabled = NO;   // 触摸穿透，不拦截下层点击
-    UILabel *lb = [[UILabel alloc] initWithFrame:marker.bounds];
-    lb.text = isPlus ? @"+" : @"-";
-    lb.textColor = [UIColor whiteColor];
-    lb.textAlignment = NSTextAlignmentCenter;
-    lb.font = [UIFont boldSystemFontOfSize:30];
     [marker addSubview:lb];
     gDebugMarker = marker;
     [w addSubview:marker];
@@ -768,7 +687,7 @@ static CGMutablePathRef gDVTTrailPath = NULL;
     sl.fillColor   = [UIColor clearColor].CGColor;
     sl.lineWidth   = 6;
     sl.lineCap     = kCALineCapRound;
-    sl.lineJoin   = kCALineJoinRound;
+    sl.lineJoin    = kCALineJoinRound;
     sl.opacity     = 0.9;
     [w.layer addSublayer:sl];
     gDVTTrailLayer = sl;
@@ -920,7 +839,7 @@ static CGPoint DVTSwipeInterp(NSArray *xs, NSArray *ys, NSArray *ts, double targ
     double ta = [ts[lo] doubleValue], tb = [ts[hi] doubleValue];
     double fa = [xs[lo] doubleValue], fb = [xs[hi] doubleValue];
     double ga = [ys[lo] doubleValue], gb = [ys[hi] doubleValue];
-    double f = (tb - ta) > 1e-6 ? (targetT - ta) / ta : 0.0;
+    double f = (tb - ta) > 1e-6 ? (targetT - ta) / (tb - ta) : 0.0;
     return CGPointMake(fa + (fb - fa) * f, ga + (gb - ga) * f);
 }
 
@@ -1174,10 +1093,10 @@ static void KeepAudioSessionActive(void) {
                                                              sampleRate:44100
                                                                channels:1
                                                             interleaved:NO];
-        [gEngine connect:player:gEngine.mainMixerNode format:fmt];
+        [gEngine connect:player to:gEngine.mainMixerNode format:fmt];
         AVAudioPCMBuffer *buf = [[AVAudioPCMBuffer alloc] initWithPCMFormat:fmt frameCapacity:44100];
         buf.frameLength = 44100;
-        [player scheduleBuffer:buf atTime:nil options:AVAudioPCMBufferLoops completionHandler:nil];
+        [player scheduleBuffer:buf atTime:nil options:AVAudioPlayerNodeBufferLoops completionHandler:nil];
         [gEngine startAndReturnError:&err];
         if (err) 
         [player play];
