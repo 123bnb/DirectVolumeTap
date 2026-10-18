@@ -1,4 +1,4 @@
-// DirectVolumeTap v1.0.15 — 移除全部日志/诊断输出（LogDVT / DiagLog / ShowLogHint / DVTLogPath 及屏幕日志位置提醒），仅保留音量键翻页核心功能
+// DirectVolumeTap v1.0.16 — 滑动模式设置页新增屏幕中心「已录 N 点」实时提示（学 PageTurnerDylib），直观看到录入点数；v1.0.15 已移除全部日志
 // 不依赖任何设置页/配置：把 dylib 注入哪个 App，就在哪个 App 生效。
 //   ① 三指长按 → 弹出「菜单」：
 //        - 音量键设置（可点进去）：出现一红一绿两个大圆点，可自由拖动，
@@ -13,7 +13,7 @@
 
 #import "ptftouch/PTFakeMetaTouch.h"
 #import <AVFoundation/AVFoundation.h>
-#import <AVFAudio/AVAudioEngine.h>
+#import <AVFAudio/AVFAudioEngine.h>
 #import <MediaPlayer/MediaPlayer.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
@@ -81,6 +81,7 @@ static BOOL VolumeHudHidden(void) {
 - (void)loadSwipes;
 - (void)drawSwipeTrails;
 - (void)drawPath:(NSArray *)pts color:(UIColor *)color alpha:(CGFloat)alpha;
+- (void)refreshSwipeTip;                             // v1.0.16：刷新屏幕中心「已录 N 点」提示
 + (void)dvtBeginTrail:(BOOL)isPlus firstPoint:(CGPoint)first;
 + (void)dvtExtendTrailTo:(CGPoint)pt isPlus:(BOOL)isPlus;
 + (void)dvtEndTrail;
@@ -91,6 +92,7 @@ static BOOL VolumeHudHidden(void) {
 @property (nonatomic, assign) NSInteger recordStage;              // 0=录第一条 1=录第二条 2=满
 @property (nonatomic, assign) CFAbsoluteTime recordStart;
 @property (nonatomic, strong) NSMutableArray<CAShapeLayer *> *swipeLayers;
+@property (nonatomic, strong) UILabel *swipeTip;         // v1.0.16：屏幕中心「已录 N 点」提示
 @end
 
 @implementation AutoSkipSettingsCenter
@@ -358,6 +360,21 @@ static BOOL VolumeHudHidden(void) {
     tip.font = [UIFont boldSystemFontOfSize:14];
     [ov addSubview:tip];
 
+    // v1.0.16：屏幕中心提示（学 PageTurnerDylib「已录 N 点」），实时显示录入点数
+    UILabel *ctip = [[UILabel alloc] initWithFrame:CGRectMake(28, 0, window.bounds.size.width - 56, 150)];
+    ctip.center = CGPointMake(window.bounds.size.width / 2, window.bounds.size.height / 2);
+    ctip.numberOfLines = 0;
+    ctip.textAlignment = NSTextAlignmentCenter;
+    ctip.font = [UIFont systemFontOfSize:16];
+    ctip.textColor = [UIColor whiteColor];
+    ctip.userInteractionEnabled = NO;
+    ctip.layer.cornerRadius = 12;
+    ctip.layer.masksToBounds = YES;
+    ctip.backgroundColor = [UIColor colorWithWhite:0 alpha:0.35];
+    self.swipeTip = ctip;
+    [ov addSubview:ctip];
+    [self refreshSwipeTip];
+
     // 复位（左） / 完成（右）
     UIButton *reset = [UIButton buttonWithType:UIButtonTypeSystem];
     reset.frame = CGRectMake(20, window.bounds.size.height - 90, 120, 48);
@@ -392,6 +409,7 @@ static BOOL VolumeHudHidden(void) {
         self.currentRecording = [NSMutableArray array];
         self.recordStart = CFAbsoluteTimeGetCurrent();
         [self.currentRecording addObject:@[@(loc.x), @(loc.y), @0]];
+        [self refreshSwipeTip];
     } else if (pan.state == UIGestureRecognizerStateChanged) {
         if (!self.currentRecording) return;
         NSArray *last = [self.currentRecording lastObject];
@@ -400,6 +418,7 @@ static BOOL VolumeHudHidden(void) {
             float t = (CFAbsoluteTimeGetCurrent() - self.recordStart) * 1000.0f;
             [self.currentRecording addObject:@[@(loc.x), @(loc.y), @(t)]];
             [self drawSwipeTrails];   // 实时显示录制轨迹
+            [self refreshSwipeTip];
         }
     } else if (pan.state == UIGestureRecognizerStateEnded) {
         if (!self.currentRecording) return;
@@ -410,6 +429,7 @@ static BOOL VolumeHudHidden(void) {
         self.recordStage++;
         self.currentRecording = nil;
         [self drawSwipeTrails];
+        [self refreshSwipeTip];
     }
 }
 
@@ -443,12 +463,34 @@ static BOOL VolumeHudHidden(void) {
     [self.swipeLayers addObject:sl];
 }
 
+// v1.0.16：屏幕中心「已录 N 点」提示（学 PageTurnerDylib，录制时实时刷新）
+- (void)refreshSwipeTip {
+    if (!self.swipeTip) return;
+    NSUInteger plus  = self.swipePlusPts  ? self.swipePlusPts.count  : 0;
+    NSUInteger minus = self.swipeMinusPts ? self.swipeMinusPts.count : 0;
+    if (self.currentRecording) {
+        // 正在录制中：实时点数
+        NSString *who = (self.recordStage == 0) ? @"音量+" : @"音量-";
+        self.swipeTip.text = [NSString stringWithFormat:@"正在录制：%@（第 %ld/2 条）\n已录 %lu 点",
+            who, (long)(self.recordStage + 1), (unsigned long)self.currentRecording.count];
+    } else if (self.recordStage >= 2 || (plus && minus)) {
+        self.swipeTip.text = [NSString stringWithFormat:@"音量+ / 音量- 已录满 ✓\n音量+ %lu 点 · 音量- %lu 点\n点「完成」保存",
+            (unsigned long)plus, (unsigned long)minus];
+    } else if (plus) {
+        self.swipeTip.text = [NSString stringWithFormat:@"音量+ 已录 %lu 点 ✓\n接着滑第 2 条：音量-",
+            (unsigned long)plus];
+    } else {
+        self.swipeTip.text = @"第一次滑动 = 音量+\n在屏幕上滑一道\n滑动时实时显示已录点数";
+    }
+}
+
 - (void)resetSwipes {
     self.swipePlusPts = [NSMutableArray array];
     self.swipeMinusPts = [NSMutableArray array];
     self.currentRecording = nil;
     self.recordStage = 0;
     [self drawSwipeTrails];
+    [self refreshSwipeTip];
 }
 
 - (void)onSwipeDone {
@@ -498,6 +540,7 @@ static BOOL VolumeHudHidden(void) {
 
 - (void)closeVolumeSettings {
     if (self.overlay) { [self.overlay removeFromSuperview]; self.overlay = nil; }
+    self.swipeTip = nil;
     [self.dotViews removeAllObjects];
 }
 
@@ -617,6 +660,87 @@ static BOOL VolumeHudHidden(void) {
     lb.textColor = [UIColor whiteColor];
     lb.textAlignment = NSTextAlignmentCenter;
     lb.font = [UIFont boldSystemFontOfSize:30];
+    [dot addSubview:lb];
+
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onDotPan:)];
+    [dot addGestureRecognizer:pan];
+
+    [self.overlay addSubview:dot];
+    [self.dotViews addObject:dot];
+    }
+}
+
+// 拖动圆点 → 更新坐标
+- (void)onDotPan:(UIPanGestureRecognizer *)pan {
+    if (!pan.view) return;
+    NSUInteger idx = [self.dotViews indexOfObject:pan.view];
+    if (idx == NSNotFound || idx >= self.points.count) return;
+    if (pan.state == UIGestureRecognizerStateBegan || pan.state == UIGestureRecognizerStateChanged) {
+        CGPoint trans = [pan translationInView:self.overlay];
+        CGPoint center = pan.view.center;
+        CGPoint newCenter = CGPointMake(center.x + trans.x, center.y + trans.y);
+        pan.view.center = newCenter;
+        [pan setTranslation:CGPointZero inView:self.overlay];
+        self.points[idx] = [NSValue valueWithCGPoint:newCenter];
+    } else if (pan.state == UIGestureRecognizerStateEnded) {
+    }
+}
+
+// ---------- 调试开关 ----------
+- (void)onDebugSwitchChanged:(UISwitch *)sw {
+    NSUserDefaults *d = Defaults();
+    [d setBool:sw.on forKey:@"debugEnabled"];
+    [d synchronize];
+}
+
+- (void)onVolumeHudSwitchChanged:(UISwitch *)sw {
+    NSUserDefaults *d = Defaults();
+    [d setObject:@(sw.on) forKey:@"volumeHudHidden"];
+    [d synchronize];
+    ApplyVolumeHudHidden(sw.on);
+}
+
++ (BOOL)isDebugEnabled {
+    return DebugEnabled();
+}
+
+// ---------- 坐标访问（供触发模块读取） ----------
++ (CGPoint)pointForPlus {
+    AutoSkipSettingsCenter *c = [AutoSkipSettingsCenter shared];
+    if (c.points.count > 0) return c.points[0].CGPointValue;
+    return CGPointMake(NSNotFound, NSNotFound);
+}
++ (CGPoint)pointForMinus {
+    AutoSkipSettingsCenter *c = [AutoSkipSettingsCenter shared];
+    if (c.points.count > 1) return c.points[1].CGPointValue;
+    return CGPointMake(NSNotFound, NSNotFound);
+}
+
+// 调试轨迹：在点击位置显示对应颜色的大圆点，短暂停留后消失
+// 关键：marker 必须 userInteractionEnabled=NO（触摸穿透，不拦截下层 App 的点击，
+//       否则模拟触摸会点到自己身上导致无法连续点触）；并复用单个 marker，
+//       避免同位置多次点击叠加变实。
++ (void)showDebugMarkerAtPoint:(CGPoint)p isPlus:(BOOL)isPlus {
+    static UIView *gDebugMarker = nil;   // 复用一个 marker，防止叠加
+    if (gDebugMarker) { [gDebugMarker removeFromSuperview]; gDebugMarker = nil; }
+
+    UIWindow *w = FindKeyWindow();   // v1.0.1：复用下方 FindKeyWindow，去重复
+    if (!w) return;
+
+    CGFloat d = 66.0;
+    UIView *marker = [[UIView alloc] initWithFrame:CGRectMake(p.x - d/2, p.y - d/2, d, d)];
+    marker.backgroundColor = isPlus ? [UIColor systemGreenColor] : [UIColor systemRedColor];
+    marker.layer.cornerRadius = d/2;
+    marker.layer.masksToBounds = YES;
+    marker.alpha = 0.8;
+    marker.layer.borderWidth = 3;
+    marker.layer.borderColor = [UIColor whiteColor].CGColor;
+    marker.userInteractionEnabled = NO;   // 触摸穿透，不拦截下层点击
+    UILabel *lb = [[UILabel alloc] initWithFrame:marker.bounds];
+    lb.text = isPlus ? @"+" : @"-";
+    lb.textColor = [UIColor whiteColor];
+    lb.textAlignment = NSTextAlignmentCenter;
+    lb.font = [UIFont boldSystemFontOfSize:30];
     [marker addSubview:lb];
     gDebugMarker = marker;
     [w addSubview:marker];
@@ -644,7 +768,7 @@ static CGMutablePathRef gDVTTrailPath = NULL;
     sl.fillColor   = [UIColor clearColor].CGColor;
     sl.lineWidth   = 6;
     sl.lineCap     = kCALineCapRound;
-    sl.lineJoin    = kCALineJoinRound;
+    sl.lineJoin   = kCALineJoinRound;
     sl.opacity     = 0.9;
     [w.layer addSublayer:sl];
     gDVTTrailLayer = sl;
@@ -796,7 +920,7 @@ static CGPoint DVTSwipeInterp(NSArray *xs, NSArray *ys, NSArray *ts, double targ
     double ta = [ts[lo] doubleValue], tb = [ts[hi] doubleValue];
     double fa = [xs[lo] doubleValue], fb = [xs[hi] doubleValue];
     double ga = [ys[lo] doubleValue], gb = [ys[hi] doubleValue];
-    double f = (tb - ta) > 1e-6 ? (targetT - ta) / (tb - ta) : 0.0;
+    double f = (tb - ta) > 1e-6 ? (targetT - ta) / ta : 0.0;
     return CGPointMake(fa + (fb - fa) * f, ga + (gb - ga) * f);
 }
 
@@ -1050,10 +1174,10 @@ static void KeepAudioSessionActive(void) {
                                                              sampleRate:44100
                                                                channels:1
                                                             interleaved:NO];
-        [gEngine connect:player to:gEngine.mainMixerNode format:fmt];
+        [gEngine connect:player:gEngine.mainMixerNode format:fmt];
         AVAudioPCMBuffer *buf = [[AVAudioPCMBuffer alloc] initWithPCMFormat:fmt frameCapacity:44100];
         buf.frameLength = 44100;
-        [player scheduleBuffer:buf atTime:nil options:AVAudioPlayerNodeBufferLoops completionHandler:nil];
+        [player scheduleBuffer:buf atTime:nil options:AVAudioPCMBufferLoops completionHandler:nil];
         [gEngine startAndReturnError:&err];
         if (err) 
         [player play];
