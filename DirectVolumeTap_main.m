@@ -1,4 +1,4 @@
-// DirectVolumeTap v1.0.19 — 稳定版：v1.0.18 真机实测通过（无静音保活时 KVO 触发正常、后台不干预其他 App 音量），机制转正。相较 v1.0.18 仅新增调试日志：进前台/退后台/触发/弹回均有 [DVT] 输出（调试开关控制），便于长期观察「会话激活但不播放」时 KVO 的稳定性。音量机制同 v1.0.18：删除静音循环保活（仅前台 setActive、退后台释放）+ 徘徊 1/16 + 前台闸 + 退后台清理连滑/回放。滑动连滑（v1.0.17）与点击模式不变。
+// DirectVolumeTap v1.0.20 — 稳定版 + 调试日志文件化：v1.0.19 基础上恢复「写文件」的调试日志——开关（菜单「轨迹可视化」）打开时，除 NSLog 外同时写宿主 App 沙盒 Documents/DVT.log（带毫秒时间戳，串行队列写入防交错，超 512KB 自动清空重建）。音量机制不变：无静音循环保活（仅前台 setActive、退后台释放）+ 徘徊 1/16 + 前台闸 + 退后台清理连滑/回放。滑动连滑（v1.0.17）与点击模式不变。
 // 不依赖任何设置页/配置：把 dylib 注入哪个 App，就在哪个 App 生效。
 //   ① 三指长按 → 弹出「菜单」：
 //        - 音量键设置（可点进去）：出现一红一绿两个大圆点，可自由拖动，
@@ -9,7 +9,7 @@
 //   ② 触发：音量键（物理/蓝牙翻页器）→ KVO outputVolume（v1.0.18：仅前台激活音频会话，不再播放静音；退后台即释放）
 //   ③ 点击：PTFakeMetaTouch 原生库（fakeTouchId:AtPoint:withTouchPhase:），王跳跳同款
 //   ④ 音量（v1.0.18）：仅前台生效；启动/进前台对齐 1/16，随按键真实移动，超 12/16 或触底弹回 1/16（徘徊，不钉死）
-// 日志：写 App 沙盒 Documents + NSLog，便于排查（固定路径 /var/mobile/... 与沙盒根目录无权限，已弃用）
+// 日志（v1.0.20）：写宿主 App 沙盒 Documents/DVT.log + NSLog（轨迹可视化开关控制；超 512KB 自动清空重建）
 
 #import "ptftouch/PTFakeMetaTouch.h"
 #import <AVFoundation/AVFoundation.h>
@@ -39,14 +39,65 @@ static BOOL DebugEnabled(void) {
     return [[Defaults() objectForKey:@"debugEnabled"] boolValue];
 }
 
-// v1.0.18：调试日志（DebugEnabled 开时才输出，默认零开销）。
-// v1.0.9~1.0.17 期间 LogDVT 曾被整体移除，本版排查「无静音保活时 KVO 是否触发」需要日志，故恢复最小实现。
+// v1.0.20：调试日志文件化（轨迹可视化开关控制）——写宿主 App 沙盒 Documents/DVT.log + NSLog。
+// v1.0.9~1.0.17 曾整体移除日志；v1.0.18/19 只恢复 NSLog；本版按老版（v1.0.8 及以前）思路捡回文件输出，
+// 路径从「沙盒根目录」改到标准 Documents（Filza 好找），并加串行队列、毫秒时间戳、512KB 自动清空。
+static NSString *DVTLogFilePath(void) {
+    NSString *home = NSHomeDirectory();
+    if (!home.length) return nil;
+    return [home stringByAppendingPathComponent:@"Documents/DVT.log"];
+}
+static dispatch_queue_t DVTLogQueue(void) {
+    static dispatch_queue_t q = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        q = dispatch_queue_create("com.yourname.directvolumetap.log", DISPATCH_QUEUE_SERIAL);
+    });
+    return q;
+}
 static void LogDVT(NSString *fmt, ...) {
-    if (!DebugEnabled()) return;
+    if (!DebugEnabled()) return;   // 调试开关关（默认）时不写盘、不 NSLog，零热路径开销
     va_list ap; va_start(ap, fmt);
     NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
-    NSLog(@"[DVT] %@", s);
+    static NSDateFormatter *df = nil;
+    static dispatch_once_t onceFmt;
+    dispatch_once(&onceFmt, ^{
+        df = [[NSDateFormatter alloc] init];
+        df.dateFormat = @"yyyy-MM-dd HH:mm:ss.SSS";
+    });
+    NSString *line = [NSString stringWithFormat:@"[DVT] %@ %@\n",
+                      [df stringFromDate:[NSDate date]], s];
+    NSLog(@"%@", line);
+    NSString *path = DVTLogFilePath();
+    if (!path) return;
+    dispatch_async(DVTLogQueue(), ^{
+        @try {
+            NSFileManager *fm = [NSFileManager defaultManager];
+            NSString *dir = [path stringByDeletingLastPathComponent];
+            if (![fm fileExistsAtPath:dir]) {
+                [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+            }
+            if ([fm fileExistsAtPath:path]) {
+                NSDictionary *attr = [fm attributesOfItemAtPath:path error:nil];
+                if (attr && [attr fileSize] > (512 * 1024)) {
+                    [fm removeItemAtPath:path error:nil];   // 超限清空重建，防止无限增长
+                }
+            }
+            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+            if (!fh) {
+                [fm createFileAtPath:path contents:nil attributes:nil];
+                fh = [NSFileHandle fileHandleForWritingAtPath:path];
+            }
+            if (fh) {
+                @try {
+                    [fh seekToEndOfFile];
+                    [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+                } @catch (NSException *e) {}
+                [fh closeFile];
+            }
+        } @catch (NSException *e) {}
+    });
 }
 
 // 隐藏音量条开关：默认开 = 隐藏系统音量条（保持当前默认行为）
