@@ -1,4 +1,4 @@
-// DirectVolumeTap v1.0.16 — 滑动模式设置页新增屏幕中心「已录 N 点」实时提示（学 PageTurnerDylib），直观看到录入点数；v1.0.15 已移除全部日志
+// DirectVolumeTap v1.0.17 — 修正版：v1.0.16 滑动态「已录 N 点」提示 + 还原 v1.0.14 的音频会话无条件激活（修复 v1.0.15 引入的 KeepAudioSessionActive 回归）
 // 不依赖任何设置页/配置：把 dylib 注入哪个 App，就在哪个 App 生效。
 //   ① 三指长按 → 弹出「菜单」：
 //        - 音量键设置（可点进去）：出现一红一绿两个大圆点，可自由拖动，
@@ -1082,9 +1082,9 @@ static void KeepAudioSessionActive(void) {
     NSError *err = nil;
     AVAudioSession *session = [AVAudioSession sharedInstance];
     [session setCategory:AVAudioSessionCategoryAmbient error:&err];
-    if (err) 
+    // v1.0.15/16 在此处误将 setActive: 塞进 `if (err)` 体，导致正常情况（err==nil）下
+    // 音频会话永不激活 → outputVolume KVO 不触发 → 映射全失效。此处无条件激活（还原 v1.0.14）。
     [session setActive:YES error:&err];
-    if (err) 
     @try {
         gEngine = [AVAudioEngine new];
         AVAudioPlayerNode *player = [AVAudioPlayerNode new];
@@ -1098,8 +1098,7 @@ static void KeepAudioSessionActive(void) {
         buf.frameLength = 44100;
         [player scheduleBuffer:buf atTime:nil options:AVAudioPlayerNodeBufferLoops completionHandler:nil];
         [gEngine startAndReturnError:&err];
-        if (err) 
-        [player play];
+        [player play];   // 同样无条件播放静音循环，保持音频会话活跃（原 v1.0.14 行为）
     } @catch (NSException *e) {
     }
 }
