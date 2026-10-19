@@ -1,4 +1,4 @@
-// DirectVolumeTap v1.0.18 — 音量机制重构：① 删除 v0.1 起延续至今的「静音循环保活」（AVAudioEngine 无限播放静音维持音频会话活跃），改为仅前台 setActive 激活会话、退后台立即释放——后台零音频痕迹，不再干预其他 App 的音量调节；② 音量从「钉死 0.5」改为「徘徊 1/16」：启动/进前台对齐 1/16，之后随音量键真实移动，超过 12/16 或触底才弹回 1/16（不钉死）；③ 新增前台闸：KVO 回调仅本 App 前台时响应；④ 退后台自动停止连滑/回放并清理触摸状态。滑动连滑（v1.0.17）与点击模式不变。
+// DirectVolumeTap v1.0.19 — 稳定版：v1.0.18 真机实测通过（无静音保活时 KVO 触发正常、后台不干预其他 App 音量），机制转正。相较 v1.0.18 仅新增调试日志：进前台/退后台/触发/弹回均有 [DVT] 输出（调试开关控制），便于长期观察「会话激活但不播放」时 KVO 的稳定性。音量机制同 v1.0.18：删除静音循环保活（仅前台 setActive、退后台释放）+ 徘徊 1/16 + 前台闸 + 退后台清理连滑/回放。滑动连滑（v1.0.17）与点击模式不变。
 // 不依赖任何设置页/配置：把 dylib 注入哪个 App，就在哪个 App 生效。
 //   ① 三指长按 → 弹出「菜单」：
 //        - 音量键设置（可点进去）：出现一红一绿两个大圆点，可自由拖动，
@@ -1145,9 +1145,12 @@ static void DVTDeactivateAudioSession(void) {
 - (void)dvtAppDidBecomeActive {
     DVTActivateAudioSession();
     SetSystemVolume(kRestVolume);
+    LogDVT(@"进前台：会话已激活，音量对齐 %.4f（当前 %.2f）", kRestVolume,
+           [AVAudioSession sharedInstance].outputVolume);
 }
 // v1.0.18：退后台 → 释放音频会话（后台零音频痕迹）+ 停掉连滑/回放并清理触摸，回前台状态干净
 - (void)dvtAppDidEnterBackground {
+    LogDVT(@"退后台：释放音频会话，停止连滑/回放");
     DVTDeactivateAudioSession();
     gSwipeBurstActive = NO;
     gSwipeBurstCount  = 0;
