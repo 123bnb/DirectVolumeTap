@@ -34,14 +34,6 @@ static float DVTGetRate(void);         // 前向声明，定义见下方（openV
 static void ApplyVolumeHudHidden(BOOL hidden);  // 前向声明，定义见下方（菜单开关与启动时调用）
 static void DVTDarwinPost(const char *name);     // 前向声明，定义见 v1.1.0 跨进程节（onVolumeHudSwitchChanged 会用到）
 
-// ---------- v1.1.0 Darwin 通知名（跨进程广播，无 payload、零依赖；SVC3 同款机制） ----------
-// 注意：宏必须定义在首次使用之前（onVolumeHudSwitchChanged 在文件前部就会用到）
-#define DVT_N_BEACON   "com.yourname.directvolumetap.beacon"     // App→SB：前台心跳（约 2s 一次）
-#define DVT_N_BYE      "com.yourname.directvolumetap.bye"        // App→SB：退到后台/非活跃
-#define DVT_N_PLUS     "com.yourname.directvolumetap.plus"       // SB→App：音量+ 已被吞掉
-#define DVT_N_MINUS    "com.yourname.directvolumetap.minus"      // SB→App：音量- 已被吞掉
-#define DVT_N_SETTINGS "com.yourname.directvolumetap.settings"   // App→SB：设置变更（重评 HUD 断言）
-
 // ---------- NSUserDefaults（独立 suite，不与 VolumeKeyTapper 混） ----------
 static NSUserDefaults *Defaults(void) {
     static NSUserDefaults *d = nil;
@@ -1033,7 +1025,12 @@ static BOOL DVTIsSpringBoardProcess(void) {
     return [[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.apple.springboard"];
 }
 
-// ---------- Darwin 通知名见文件顶部（onVolumeHudSwitchChanged 在前部要用，宏必须提前定义） ----------
+// ---------- Darwin 通知名（跨进程广播，无 payload、零依赖；SVC3 同款机制） ----------
+#define DVT_N_BEACON   "com.yourname.directvolumetap.beacon"     // App→SB：前台心跳（约 2s 一次）
+#define DVT_N_BYE      "com.yourname.directvolumetap.bye"        // App→SB：退到后台/非活跃
+#define DVT_N_PLUS     "com.yourname.directvolumetap.plus"       // SB→App：音量+ 已被吞掉
+#define DVT_N_MINUS    "com.yourname.directvolumetap.minus"      // SB→App：音量- 已被吞掉
+#define DVT_N_SETTINGS "com.yourname.directvolumetap.settings"   // App→SB：设置变更（重评 HUD 断言）
 
 static void DVTDarwinPost(const char *name) {
     // 注意：CFSTR 只接受字面量，这里 name 是变量，必须用 CFStringCreateWithCString
@@ -1143,9 +1140,6 @@ static void DVTSBScheduleRepeat(BOOL isPlus, NSInteger gen) {
 }
 
 // 钩子实现：替换 SBVolumeControl.handleVolumeButtonWithType:down:
-// 注意：iOS SDK 的 IMP 默认是 void(*)(void) 零参数签名（见 objc.h 的 OBJC_OLD_DISPATCH_PROTOTYPES），
-// 调原实现必须显式转型成匹配的函数指针类型，否则编译报 "expected 0, have 4"。
-typedef void (*DVTVolumeButtonFn)(id, SEL, int64_t, BOOL);
 static void DVTSBVolumeButton(id self, SEL _cmd, int64_t type, BOOL down) {
     IMP orig = gOrigVolumeButtonIMP;
     if (!orig) return;                                  // 理论上不会发生（装不上就不会被调用）
@@ -1153,7 +1147,7 @@ static void DVTSBVolumeButton(id self, SEL _cmd, int64_t type, BOOL down) {
     if (!isVolume || !DVTBeaconActive()) {
         // 非音量键，或目标 App 不在前台 → 完全放行：系统原生行为（音量照变、HUD 照出）
         DVTSBEvaluateAssertion();                       // 顺带纠正断言持有状态
-        ((DVTVolumeButtonFn)orig)(self, _cmd, type, down);
+        orig(self, _cmd, type, down);
         return;
     }
     if (gSBVolumeControl != self) gSBVolumeControl = self;   // 顺手捕获实例
