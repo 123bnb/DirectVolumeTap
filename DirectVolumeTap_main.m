@@ -1,4 +1,4 @@
-// DirectVolumeTap v1.0.16 — 修正版：保留滑动设置页「已录 N 点」提示 + 还原 v1.0.14 的音频会话无条件激活（修复 v1.0.15 引入的 KeepAudioSessionActive 回归）
+// DirectVolumeTap v1.0.17 — 试用版：v1.0.16 + 「滑动连滑」。仅滑动模式：滑动回放期间连按音量键（第2次提示"再按一次进入连滑"，第3次"已进入连滑"）即进入连滑，连滑=每次收尾后无缝续同一方向滑动（无间隔）；连滑中再随意按一次即停（"已退出连滑"）。三条提示均用顶部小胶囊（2s 自动消失）。点击模式不变。
 // 不依赖任何设置页/配置：把 dylib 注入哪个 App，就在哪个 App 生效。
 //   ① 三指长按 → 弹出「菜单」：
 //        - 音量键设置（可点进去）：出现一红一绿两个大圆点，可自由拖动，
@@ -25,6 +25,7 @@ static BOOL DebugEnabled(void);        // 前向声明，定义见下方
 static UIWindow *FindKeyWindow(void);  // 前向声明，定义见下方（showDebugMarkerAtPoint 复用）
 static float DVTGetRate(void);         // 前向声明，定义见下方（openVolumeSettings 中设置滑块初值会先用到）
 static void ApplyVolumeHudHidden(BOOL hidden);  // 前向声明，定义见下方（菜单开关与启动时调用）
+static void StartSwipeReplay(BOOL isPlus);       // 前向声明，定义见下方（dvtFinishSwipe 连发续滑会先用到）
 
 // ---------- NSUserDefaults（独立 suite，不与 VolumeKeyTapper 混） ----------
 static NSUserDefaults *Defaults(void) {
@@ -85,7 +86,7 @@ static BOOL VolumeHudHidden(void) {
 + (void)dvtBeginTrail:(BOOL)isPlus firstPoint:(CGPoint)first;
 + (void)dvtExtendTrailTo:(CGPoint)pt isPlus:(BOOL)isPlus;
 + (void)dvtEndTrail;
-+ (void)showBusyHint;
++ (void)showPill:(NSString *)msg;
 @property (nonatomic, strong) NSMutableArray *swipePlusPts;        // 音量+ 轨迹点(NSArray<[x,y,t]>)
 @property (nonatomic, strong) NSMutableArray *swipeMinusPts;       // 音量- 轨迹点
 @property (nonatomic, strong) NSMutableArray *currentRecording;
@@ -713,9 +714,9 @@ static CGMutablePathRef gDVTTrailPath = NULL;
                    dispatch_get_main_queue(), ^{ [sl removeFromSuperlayer]; });
 }
 
-// v1.0.4：防狂按提示——回放进行中再次触发音量键时，在屏幕顶部（灵动岛下方）浮现小字
+// v1.0.17：顶部小胶囊提示（连滑各状态共用）——复用原「请等待滑动完成」形态，文案参数化，2 秒自动消失
 static UILabel *gBusyHint = nil;
-+ (void)showBusyHint {
++ (void)showPill:(NSString *)msg {
     UIWindow *w = FindKeyWindow();
     if (!w) return;
     if (gBusyHint) { [gBusyHint removeFromSuperview]; gBusyHint = nil; }
@@ -723,7 +724,7 @@ static UILabel *gBusyHint = nil;
     if (@available(iOS 11.0, *)) topInset = w.safeAreaInsets.top;
     CGFloat y = topInset + 44;
     UILabel *h = [[UILabel alloc] initWithFrame:CGRectMake(w.bounds.size.width/2 - 120, y, 240, 30)];
-    h.text = @"请等待滑动完成";
+    h.text = msg.length ? msg : @"请等待滑动完成";
     h.textColor = [UIColor whiteColor];
     h.textAlignment = NSTextAlignmentCenter;
     h.font = [UIFont systemFontOfSize:13];
@@ -733,7 +734,7 @@ static UILabel *gBusyHint = nil;
     [w addSubview:h];
     [w bringSubviewToFront:h];
     gBusyHint = h;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (gBusyHint == h) { [h removeFromSuperview]; gBusyHint = nil; }
     });
@@ -791,6 +792,14 @@ static NSArray *LoadSwipePts(NSString *key) {
 // 回放时长 = 录制时长（1:1 还原真实手指的流畅感）。
 static BOOL gSwipeRunning = NO;   // 防狂按：回放进行中
 
+// ===== v1.0.17：滑动连发（连按触发，仅滑动模式）=====
+// 复用「滑动回放期间」当检测窗口：回放中每来一次有效按压就累计一次，连按达阈值即进入连发；
+// 连发 = 每次滑动收尾后无缝续同一方向滑动（无间隔重复）；连发中再随意按一次音量键即停。
+static NSInteger gSwipeBurstCount  = 0;    // 当前窗口内累计按压次数（含起滑那一次）
+static BOOL      gSwipeBurstActive = NO;   // 是否连发中
+static BOOL      gSwipeBurstPlus   = YES;  // 连发方向（YES=音量+，NO=音量-）
+static const NSInteger kSwipeBurstThreshold = 3;  // 连按几次触发连发
+
 @interface DVTSwipeTickProxy : NSObject
 @property (nonatomic, copy) void (^tick)(void);
 - (void)onTick:(CADisplayLink *)link;
@@ -822,6 +831,10 @@ static void dvtFinishSwipe(void) {
     gSwipeProxy = nil;
     if (gSwipeWatchdog) { dispatch_block_cancel(gSwipeWatchdog); gSwipeWatchdog = nil; }
     gSwipeRunning = NO;
+    // v1.0.17 连发：本段收尾后无缝续同一方向滑动（无间隔重复触发映射滑动）
+    if (gSwipeBurstActive) {
+        StartSwipeReplay(gSwipeBurstPlus);
+    }
 }
 
 // 按时间线性插值取坐标（二分定位区间）
@@ -915,23 +928,48 @@ static void DVTFakeSwipe(NSArray *pts, BOOL isPlus) {
                    dispatch_get_main_queue(), wdog);
 }
 
+// v1.0.17：起一段滑动回放（普通起滑与连发续滑共用）。
+// 读不到轨迹则提示并退出连发；否则立即标记回放中，再切主队列由 DVTFakeSwipe 逐帧回放。
+static void StartSwipeReplay(BOOL isPlus) {
+    NSArray *pts = isPlus ? LoadSwipePts(@"swipePlus") : LoadSwipePts(@"swipeMinus");
+    if (pts.count < 2) {
+        ShowToast([NSString stringWithFormat:@"滑动模式未录制%@轨迹", isPlus ? @"音量+" : @"音量-"]);
+        gSwipeBurstActive = NO;   // 没轨迹可放，退出连发
+        return;
+    }
+    gSwipeRunning = YES;   // 立即标记回放中（异步块执行前也能拦截重复触发 / 供连发判定）
+    // fakeTouchId 必须主线程：切主队列，由 DVTFakeSwipe 内部 CADisplayLink(main) 逐帧回放
+    dispatch_async(dispatch_get_main_queue(), ^{ DVTFakeSwipe(pts, isPlus); });
+}
+
 // 按方向点击/滑动：delta>0 音量+，delta<0 音量-
 static void TapPoints(float delta) {
     BOOL isPlus = (delta > 0);
     // v1.0.1：滑动模式 → 按录制轨迹完美回放
     if ([[Defaults() objectForKey:@"mode"] isEqualToString:@"swipe"]) {
-        if (gSwipeRunning) {   // 防狂按：回放进行中，拦截新触发并提示
-            [AutoSkipSettingsCenter showBusyHint];
+        if (gSwipeRunning) {   // 回放中（= 连按检测窗口）
+            if (gSwipeBurstActive) {
+                // v1.0.17 连滑中：这一次有效按压 = 停止连滑（仅作停止信号，不再起新滑）
+                gSwipeBurstActive = NO;
+                gSwipeBurstCount  = 0;
+                [AutoSkipSettingsCenter showPill:@"已退出连滑"];
+                return;
+            }
+            // v1.0.17 普通窗口期：累计连按次数，达到阈值即进入连滑
+            gSwipeBurstCount++;
+            if (gSwipeBurstCount == kSwipeBurstThreshold - 1) {
+                [AutoSkipSettingsCenter showPill:@"再按一次进入连滑"];
+            } else if (gSwipeBurstCount >= kSwipeBurstThreshold) {
+                gSwipeBurstActive = YES;
+                gSwipeBurstPlus   = isPlus;   // 连滑方向 = 当前这段滑动的方向
+                [AutoSkipSettingsCenter showPill:@"已进入连滑"];
+            }
             return;
         }
-        NSArray *pts = isPlus ? LoadSwipePts(@"swipePlus") : LoadSwipePts(@"swipeMinus");
-        if (pts.count < 2) {
-            ShowToast([NSString stringWithFormat:@"滑动模式未录制%@轨迹", isPlus ? @"音量+" : @"音量-"]);
-            return;
-        }
-        gSwipeRunning = YES;   // 标记回放中（狂按将被拦截）
-        // fakeTouchId 必须主线程：切主队列，由 DVTFakeSwipe 内部 CADisplayLink(main) 逐帧回放
-        dispatch_async(dispatch_get_main_queue(), ^{ DVTFakeSwipe(pts, isPlus); });
+        // 不在回放中：起新滑，开启新的检测窗口（本次按压计为第 1 次）
+        gSwipeBurstCount = 1;
+        gSwipeBurstPlus  = isPlus;
+        StartSwipeReplay(isPlus);
         return;
     }
     // 点击模式（原逻辑不变）
