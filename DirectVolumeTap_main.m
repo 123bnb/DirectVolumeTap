@@ -1,4 +1,4 @@
-// DirectVolumeTap v1.0.17 — 修正版：v1.0.16 滑动态「已录 N 点」提示 + 还原 v1.0.14 的音频会话无条件激活（修复 v1.0.15 引入的 KeepAudioSessionActive 回归）
+// DirectVolumeTap v1.0.16 — 修正版：保留滑动设置页「已录 N 点」提示 + 还原 v1.0.14 的音频会话无条件激活（修复 v1.0.15 引入的 KeepAudioSessionActive 回归）
 // 不依赖任何设置页/配置：把 dylib 注入哪个 App，就在哪个 App 生效。
 //   ① 三指长按 → 弹出「菜单」：
 //        - 音量键设置（可点进去）：出现一红一绿两个大圆点，可自由拖动，
