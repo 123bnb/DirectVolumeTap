@@ -1,4 +1,4 @@
-// DirectVolumeTap v1.0.17 — 试用版：v1.0.16 + 「滑动连滑」。仅滑动模式：滑动回放期间连按音量键（第2次提示"再按一次进入连滑"，第3次"已进入连滑"）即进入连滑，连滑=每次收尾后无缝续同一方向滑动（无间隔）；连滑中再随意按一次即停（"已退出连滑"）。三条提示均用顶部小胶囊（2s 自动消失）。点击模式不变。
+// DirectVolumeTap v1.0.18 — 音量机制重构：① 删除 v0.1 起延续至今的「静音循环保活」（AVAudioEngine 无限播放静音维持音频会话活跃），改为仅前台 setActive 激活会话、退后台立即释放——后台零音频痕迹，不再干预其他 App 的音量调节；② 音量从「钉死 0.5」改为「徘徊 1/16」：启动/进前台对齐 1/16，之后随音量键真实移动，超过 12/16 或触底才弹回 1/16（不钉死）；③ 新增前台闸：KVO 回调仅本 App 前台时响应；④ 退后台自动停止连滑/回放并清理触摸状态。滑动连滑（v1.0.17）与点击模式不变。
 // 不依赖任何设置页/配置：把 dylib 注入哪个 App，就在哪个 App 生效。
 //   ① 三指长按 → 弹出「菜单」：
 //        - 音量键设置（可点进去）：出现一红一绿两个大圆点，可自由拖动，
@@ -6,14 +6,13 @@
 //          底部有「保存」「复位」两个按钮（保存记录坐标并关闭；复位回到初始位置）。
 //        - 调试开关（纯开关）：默认关闭。打开后，按物理音量键触发的点击
 //          会在点击位置显示对应颜色的大圆点轨迹；关闭则点击完全隐形。
-//   ② 触发：音量键（物理/蓝牙翻页器）→ KVO outputVolume（需激活静音音频会话）
+//   ② 触发：音量键（物理/蓝牙翻页器）→ KVO outputVolume（v1.0.18：仅前台激活音频会话，不再播放静音；退后台即释放）
 //   ③ 点击：PTFakeMetaTouch 原生库（fakeTouchId:AtPoint:withTouchPhase:），王跳跳同款
-//   ④ 复位：到顶/底自动拉回中间 0.3，防止按键失效
+//   ④ 音量（v1.0.18）：仅前台生效；启动/进前台对齐 1/16，随按键真实移动，超 12/16 或触底弹回 1/16（徘徊，不钉死）
 // 日志：写 App 沙盒 Documents + NSLog，便于排查（固定路径 /var/mobile/... 与沙盒根目录无权限，已弃用）
 
 #import "ptftouch/PTFakeMetaTouch.h"
 #import <AVFoundation/AVFoundation.h>
-#import <AVFAudio/AVAudioEngine.h>
 #import <MediaPlayer/MediaPlayer.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
@@ -38,6 +37,16 @@ static NSUserDefaults *Defaults(void) {
 // 调试开关默认关闭；打开时按音量键点击会显示轨迹标注
 static BOOL DebugEnabled(void) {
     return [[Defaults() objectForKey:@"debugEnabled"] boolValue];
+}
+
+// v1.0.18：调试日志（DebugEnabled 开时才输出，默认零开销）。
+// v1.0.9~1.0.17 期间 LogDVT 曾被整体移除，本版排查「无静音保活时 KVO 是否触发」需要日志，故恢复最小实现。
+static void LogDVT(NSString *fmt, ...) {
+    if (!DebugEnabled()) return;
+    va_list ap; va_start(ap, fmt);
+    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    NSLog(@"[DVT] %@", s);
 }
 
 // 隐藏音量条开关：默认开 = 隐藏系统音量条（保持当前默认行为）
@@ -995,8 +1004,8 @@ static void TapPoints(float delta) {
 // 去抖窗口：仅合并「单次按键产生的重复 KVO」（通常 < 100ms），
 // 不再吞掉用户有意的快速连按（原 250ms 过激，翻页连按常被吞）
 static const double kTapDebounceSec = 0.10;
-// 单次音量键步长约 0.05；按 delta 估算被合并的按键次数，连按合并也能逐页翻（防被吞）
-static const float kVolumeStep = 0.05f;
+// v1.0.18：单次音量键步长 = 1/16 ≈ 0.0625（实测 0→满 16 档）；按 delta 估算被合并的按键次数，连按合并也能逐页翻（防被吞）
+static const float kVolumeStep = 1.0f / 16.0f;
 static CFAbsoluteTime gLastTap = 0;
 static void TapPointsDebounced(float delta) {
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
@@ -1070,76 +1079,95 @@ static void SetSystemVolume(float v) {
     }
 }
 
-// 方案 B：把音量「钉死」在固定值。每次检测到音量偏离 gPinnedVolume（即用户按了音量键），
-// 立即同步把音量设回 gPinnedVolume，既不漂移也不触底，HUD 不再闪烁/循环。
-// 回写判定不再依赖易竞态的全局 flag：回写时音量必等于 gPinnedVolume，故按 now 是否≈钉定值来区分。
-static float gPinnedVolume = 0.5f;   // 钉在中间，远离 0/1 两端，保证 + / - 都能产生可检测的变化
+// v1.0.18：音量「徘徊」方案（替代 v1.0.9~v1.0.17 的「钉死 0.5」）。
+// 不钉死：音量随按键真实移动；仅当超过 12/16 或触底时，才弹回 1/16（kRestVolume）。
+// 启动/进前台时对齐到 1/16；delta 用 KVO 的 old→now（无回写污染，回归 v1.0.8 算法）。
+static const float kRestVolume = 1.0f / 16.0f;   // 徘徊目标：1/16（0.0625）
+static const float kBoundHigh = 0.75f;           // 超过 12/16 弹回
+static const float kBoundLow  = 0.0f;            // 触底弹回
+static BOOL VolumeNeedsReset(float v) { return (v > kBoundHigh || v <= kBoundLow); }
 
-// 同步把音量钉回固定值（不延迟）
-static void PinVolume(void) {
-    SetSystemVolume(gPinnedVolume);
+// 触界才拉回 1/16（50ms 延迟，避开与本次 KVO 的同帧竞态；v1.0.8 同款手段）
+static void DoReset(float oldVol, float nowVol) {
+    if (VolumeNeedsReset(nowVol) || VolumeNeedsReset(oldVol)) {
+        LogDVT(@"音量越界(%.2f→%.2f)，弹回 %.4f", oldVol, nowVol, kRestVolume);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ SetSystemVolume(kRestVolume); });
+    }
+}
+
+// v1.0.18：仅「激活」音频会话（KVO outputVolume 才触发），不再播放静音保活。
+// v1.0.15/16 事故证明的是「会话不激活 → KVO 不触发」；静音循环是 v0.1 起过度谨慎的产物，从未被单独验证。
+// 前台才激活、退后台立即释放：后台零音频痕迹，也不会再干预其他 App 的音量。
+static void DVTActivateAudioSession(void) {
+    NSError *err = nil;
+    AVAudioSession *session = [AVAudioSession sharedInstance];
+    [session setCategory:AVAudioSessionCategoryAmbient error:&err];
+    // 无条件激活（v1.0.15/16 曾误将本行塞进 if (err) 体导致映射全失效，勿再改回去）
+    [session setActive:YES error:&err];
+}
+static void DVTDeactivateAudioSession(void) {
+    NSError *err = nil;
+    [[AVAudioSession sharedInstance] setActive:NO error:&err];
 }
 
 // 监听
 @interface DirectVolumeObserver : NSObject
+- (void)dvtAppDidBecomeActive;      // v1.0.18：进前台（含冷启动）
+- (void)dvtAppDidEnterBackground;   // v1.0.18：退后台
 @end
 @implementation DirectVolumeObserver
 - (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object
                         change:(NSDictionary<NSKeyValueChangeKey, id> *)change
                        context:(void *)context {
     if (![keyPath isEqualToString:@"outputVolume"]) return;
+    // v1.0.18 前台闸：仅本 App 前台时干预。退后台会话已释放，KVO 本就不该再来；
+    // 双保险——即使后台仍收到回调（其他音频路径引起），也直接忽略，绝不影响其他 App 的音量。
+    if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) return;
     NSNumber *oldN = change[NSKeyValueChangeOldKey];
     NSNumber *newN = change[NSKeyValueChangeNewKey];
-    if (!newN) return;
-    float now = newN.floatValue;
-    float old = oldN ? oldN.floatValue : -1.0f;
-    float diff = fabsf(now - gPinnedVolume);
-    float rawDelta = oldN ? (now - old) : 0.0f;
-    // 回写/稳态：我们把音量钉回 gPinnedVolume，回写时 now 恰好等于钉定值 → 忽略（无 flag 竞态，不会吞真实按键）
-    if (diff < 0.02f) {
-        return;
-    }
-    // 真实按键：now 偏离钉定值。delta 以钉定为基准，规避 old 被回写污染的竞态
-    float delta = now - gPinnedVolume;
-    TapPointsDebounced(delta);            // 用这次变化触发点击（+ / - 由 delta 符号决定）
-    PinVolume();                          // 立即同步钉回固定值（消除边界循环，下一轮 now==gPinnedVolume 自动忽略）
+    if (!oldN || !newN) return;
+    float old = oldN.floatValue, now = newN.floatValue;
+    float delta = now - old;
+    if (fabsf(delta) < 0.0005f) return;    // 抖动过滤
+    // 停在 1/16（含我们自己的对齐/弹回写回）→ 无动作（替代旧 flag 竞态判定）
+    if (fabsf(now - kRestVolume) < 0.001f) return;
+    // 弹回副作用双保险：旧值越界且新值≈1/16 → 插件自己拉的，不触发
+    if (VolumeNeedsReset(old) && fabsf(now - kRestVolume) < 0.05f) return;
+    LogDVT(@"音量%@ delta=%+.2f 当前=%0.2f → 触发", delta > 0 ? @"+" : @"-", delta, now);
+    TapPointsDebounced(delta);             // 用这次变化触发点击/滑动（+ / - 由 delta 符号决定）
+    DoReset(old, now);                     // 触界才弹回 1/16（不钉死）
 }
 - (void)volChanged:(NSNotification *)notif {
     // v1.0.1：已删除空壳实现（KVO 已负责，避免重复触发通道）
 }
+// v1.0.18：进前台（含冷启动）→ 激活音频会话 + 音量对齐 1/16
+- (void)dvtAppDidBecomeActive {
+    DVTActivateAudioSession();
+    SetSystemVolume(kRestVolume);
+}
+// v1.0.18：退后台 → 释放音频会话（后台零音频痕迹）+ 停掉连滑/回放并清理触摸，回前台状态干净
+- (void)dvtAppDidEnterBackground {
+    DVTDeactivateAudioSession();
+    gSwipeBurstActive = NO;
+    gSwipeBurstCount  = 0;
+    if (gSwipeRunning) {
+        if (gSwipeLink) { [gSwipeLink invalidate]; gSwipeLink = nil; }
+        gSwipeProxy = nil;
+        if (gSwipeWatchdog) { dispatch_block_cancel(gSwipeWatchdog); gSwipeWatchdog = nil; }
+        if (gSwipePid >= 0 && !gSwipeEnded) {
+            [PTFakeMetaTouch fakeTouchId:gSwipePid AtPoint:CGPointZero withTouchPhase:UITouchPhaseEnded];
+            gSwipeEnded = YES;
+        }
+        gSwipeRunning  = NO;
+        gSwipeFinished = YES;   // 防止 watchdog 再收尾
+    }
+}
 @end
 
 // 注：已移除方案 A（hook UIApplication _handleKeyUIEvent: 吞音量键）。
-// 非越狱注入环境下，系统音量由 SpringBoard/音频守护进程在 App 进程外改写，
-// UIKit 事件层处于下游，吞键无法阻止系统音量变化；且该 hook 的 keyCode 取不到值实际为空转。
-// 现统一走方案 B：KVO 检测变化 + 同步钉回固定音量 + MPVolumeView 抑制 HUD。
-
-// 关键：保持音频会话活跃（KVO outputVolume 才触发）
-static AVAudioEngine *gEngine = nil;
-static void KeepAudioSessionActive(void) {
-    NSError *err = nil;
-    AVAudioSession *session = [AVAudioSession sharedInstance];
-    [session setCategory:AVAudioSessionCategoryAmbient error:&err];
-    // v1.0.15/16 在此处误将 setActive: 塞进 `if (err)` 体，导致正常情况（err==nil）下
-    // 音频会话永不激活 → outputVolume KVO 不触发 → 映射全失效。此处无条件激活（还原 v1.0.14）。
-    [session setActive:YES error:&err];
-    @try {
-        gEngine = [AVAudioEngine new];
-        AVAudioPlayerNode *player = [AVAudioPlayerNode new];
-        [gEngine attachNode:player];
-        AVAudioFormat *fmt = [[AVAudioFormat alloc] initWithCommonFormat:AVAudioPCMFormatFloat32
-                                                             sampleRate:44100
-                                                               channels:1
-                                                            interleaved:NO];
-        [gEngine connect:player to:gEngine.mainMixerNode format:fmt];
-        AVAudioPCMBuffer *buf = [[AVAudioPCMBuffer alloc] initWithPCMFormat:fmt frameCapacity:44100];
-        buf.frameLength = 44100;
-        [player scheduleBuffer:buf atTime:nil options:AVAudioPlayerNodeBufferLoops completionHandler:nil];
-        [gEngine startAndReturnError:&err];
-        [player play];   // 同样无条件播放静音循环，保持音频会话活跃（原 v1.0.14 行为）
-    } @catch (NSException *e) {
-    }
-}
+// 系统音量由 SpringBoard/音频守护进程在 App 进程外改写，UIKit 事件层处于下游，吞键无法阻止系统音量变化。
+// 现统一走：KVO 检测变化 + 触界弹回 1/16（不钉死）+ MPVolumeView 抑制 HUD + 仅前台干预。
 
 // =====================================================
 // constructor：注入自启动（注入即生效，无勾选判断）
@@ -1157,12 +1185,15 @@ static void DirectTapInit(void) {
                                                  options:NSKeyValueObservingOptionOld | NSKeyValueObservingOptionNew
                                                  context:NULL];
             // v1.0.1：删除系统通知观察者注册（volChanged: 空壳，KVO 已负责，避免重复触发通道）
-            KeepAudioSessionActive();
-            ApplyVolumeHudHidden(VolumeHudHidden());   // 先尝试挂载（窗口可能尚未就绪，下面 1s 后会再挂载一次）
-            float bootVol = [AVAudioSession sharedInstance].outputVolume;
-            if (fabsf(bootVol - gPinnedVolume) > 0.02f) {
-                PinVolume();
+            // v1.0.18：前后台感知——前台才激活音频会话并对齐音量；退后台立即释放，不再后台保活
+            [[NSNotificationCenter defaultCenter] addObserver:gObs selector:@selector(dvtAppDidBecomeActive)
+                                                         name:UIApplicationDidBecomeActiveNotification object:nil];
+            [[NSNotificationCenter defaultCenter] addObserver:gObs selector:@selector(dvtAppDidEnterBackground)
+                                                         name:UIApplicationDidEnterBackgroundNotification object:nil];
+            if ([UIApplication sharedApplication].applicationState == UIApplicationStateActive) {
+                [gObs dvtAppDidBecomeActive];   // 注入时已在前台（晚注入/热重载）→ 立即生效
             }
+            ApplyVolumeHudHidden(VolumeHudHidden());   // 先尝试挂载（窗口可能尚未就绪，下面 1s 后会再挂载一次）
             [[AutoSkipSettingsCenter shared] loadPoints];
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
