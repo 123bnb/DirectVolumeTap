@@ -1,10 +1,7 @@
-// DirectVolumeTap v1.1.1 — v1.1.0 的真机回归修复版（参考 Apple iOS 18.2 反编译源码）：
-//   SpringBoard 侧钩 SBVolumeControl.handleVolumeButtonWithType:down:，但**不再吞键**——
-//   只按「前台心跳 + 用户偏好」持有 Apple 官方 HUD 隐藏断言
-//   acquireVolumeHUDHiddenAssertionForReason: 后原样放行按键；音量照常变化 → App 侧 KVO
-//   照常触发映射（v1.0.x 验证过的唯一触发链），断言只负责音量条不弹。
-//   （v1.1.0 曾在钩子里吞键 + Darwin 回传触发映射，真机实测回传一断映射全死，故废弃。）
-//   v1.0.16 滑动设置页「已录 N 点」提示保留。
+// DirectVolumeTap v1.1.0 — 新增 SpringBoard 侧系统级拦截（参考 Apple iOS 18.2 反编译源码：
+//   SBVolumeControl.handleVolumeButtonWithType:down: 102=音量+/103=音量- 在源头吞掉按键，
+//   音量数值不变、HUD 不弹；HUD 抑制升级为 Apple 官方断言 acquireVolumeHUDHiddenAssertionForReason:；
+//   按键事件经 Darwin 通知广播给 App 执行点击/滑动）。v1.0.16 滑动设置页「已录 N 点」提示保留。
 // 不依赖任何设置页/配置：把 dylib 注入哪个 App，就在哪个 App 生效。
 //   ① 三指长按 → 弹出「菜单」：
 //        - 音量键设置（可点进去）：出现一红一绿两个大圆点，可自由拖动，
@@ -12,11 +9,13 @@
 //          底部有「保存」「复位」两个按钮（保存记录坐标并关闭；复位回到初始位置）。
 //        - 调试开关（纯开关）：默认关闭。打开后，按物理音量键触发的点击
 //          会在点击位置显示对应颜色的大圆点轨迹；关闭则点击完全隐形。
-//   ② 触发（唯一通道，v1.0.x 起验证）：KVO 监听 AVAudioSession.outputVolume，
-//      检测到变化 → 立即把音量钉回固定值（gPinnedVolume=0.5）并触发点击/滑动。
-//      注入 SpringBoard（可选）只是额外让 Apple 官方断言抑制音量条，映射本身不依赖它。
+//   ② 触发（v1.1.0 起双通道，自动选择）：
+//      · 系统级（推荐）：额外把本 dylib 注入 SpringBoard → 钩 SBVolumeControl 音量键，
+//        在源头吞掉（音量数值不变、HUD 不弹），经 Darwin 通知广播给 App 执行点击/滑动；
+//        只有本 App 在前台时才吞键，其余场景音量键完全放行（系统原生行为）
+//      · 兼容（仅注入 App）：KVO outputVolume（需激活静音音频会话），v1.0.16 原逻辑
 //   ③ 点击：PTFakeMetaTouch 原生库（fakeTouchId:AtPoint:withTouchPhase:），王跳跳同款
-//   ④ 复位：到顶/底自动拉回中间 0.3，防止按键失效
+//   ④ 复位：到顶/底自动拉回中间 0.3，防止按键失效（仅兼容通道需要）
 // 日志：写 App 沙盒 Documents + NSLog，便于排查（固定路径 /var/mobile/... 与沙盒根目录无权限，已弃用）
 
 #import "ptftouch/PTFakeMetaTouch.h"
@@ -33,14 +32,15 @@ static BOOL DebugEnabled(void);        // 前向声明，定义见下方
 static UIWindow *FindKeyWindow(void);  // 前向声明，定义见下方（showDebugMarkerAtPoint 复用）
 static float DVTGetRate(void);         // 前向声明，定义见下方（openVolumeSettings 中设置滑块初值会先用到）
 static void ApplyVolumeHudHidden(BOOL hidden);  // 前向声明，定义见下方（菜单开关与启动时调用）
-static void DVTDarwinPost(const char *name);     // 前向声明，定义见 v1.1.1 跨进程节（onVolumeHudSwitchChanged 会用到）
+static void DVTDarwinPost(const char *name);     // 前向声明，定义见 v1.1.0 跨进程节（onVolumeHudSwitchChanged 会用到）
 
-// ---------- v1.1.1 Darwin 通知名（App→SpringBoard 单向广播，无 payload；SVC3 同款机制） ----------
+// ---------- v1.1.0 Darwin 通知名（跨进程广播，无 payload、零依赖；SVC3 同款机制） ----------
 // 注意：宏必须定义在首次使用之前（onVolumeHudSwitchChanged 在文件前部就会用到）
-#define DVT_N_BEACON  "com.yourname.directvolumetap.beacon"   // App→SB：前台心跳（约 2s 一次）
-#define DVT_N_BYE     "com.yourname.directvolumetap.bye"      // App→SB：退到后台/非活跃
-#define DVT_N_HUD_ON  "com.yourname.directvolumetap.hud.on"   // App→SB：用户选择「隐藏音量条」
-#define DVT_N_HUD_OFF "com.yourname.directvolumetap.hud.off"  // App→SB：用户选择「显示音量条」
+#define DVT_N_BEACON   "com.yourname.directvolumetap.beacon"     // App→SB：前台心跳（约 2s 一次）
+#define DVT_N_BYE      "com.yourname.directvolumetap.bye"        // App→SB：退到后台/非活跃
+#define DVT_N_PLUS     "com.yourname.directvolumetap.plus"       // SB→App：音量+ 已被吞掉
+#define DVT_N_MINUS    "com.yourname.directvolumetap.minus"      // SB→App：音量- 已被吞掉
+#define DVT_N_SETTINGS "com.yourname.directvolumetap.settings"   // App→SB：设置变更（重评 HUD 断言）
 
 // ---------- NSUserDefaults（独立 suite，不与 VolumeKeyTapper 混） ----------
 static NSUserDefaults *Defaults(void) {
@@ -296,16 +296,15 @@ static BOOL VolumeHudHidden(void) {
     [modeEntry addTarget:self action:(isSwipe ? @selector(openSwipeModeSettings) : @selector(openVolumeSettings)) forControlEvents:UIControlEventTouchUpInside];
     [panel addSubview:modeEntry];
 
-    // v1.1.1：系统级音量条抑制状态（SpringBoard 侧钩子是否装上；由 SpringBoard 写入共享 suite，
-    // 仅状态提示——映射功能由 KVO 驱动，与此状态无关）
+    // v1.1.0：系统级拦截状态（SpringBoard 侧钩子是否生效；由 SpringBoard 写入共享 suite）
     UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(16, 310, pw - 32, 22)];
     st.textAlignment = NSTextAlignmentCenter;
     st.font = [UIFont systemFontOfSize:11];
     st.textColor = [UIColor systemGrayColor];
     st.numberOfLines = 2;
     st.text = [Defaults() boolForKey:@"sbHookActive"]
-        ? @"系统级音量条抑制：已生效\n（映射由音量变化驱动，始终可用）"
-        : @"系统级音量条抑制：未生效\n（映射不受影响；音量条可能短暂闪烁）";
+        ? @"系统级拦截：已生效\n（音量不变，按键由 SpringBoard 广播驱动）"
+        : @"系统级拦截：未生效\n（兼容模式：KVO 检测 + 钉回音量）";
     [panel addSubview:st];
 
     [window addSubview:mv];
@@ -645,8 +644,7 @@ static BOOL VolumeHudHidden(void) {
     [d setObject:@(sw.on) forKey:@"volumeHudHidden"];
     [d synchronize];
     ApplyVolumeHudHidden(sw.on);
-    // v1.1.1：偏好变化广播给 SpringBoard（Darwin 通知无 payload，偏好值编进通知名）
-    DVTDarwinPost(sw.on ? DVT_N_HUD_ON : DVT_N_HUD_OFF);
+    DVTDarwinPost(DVT_N_SETTINGS);   // v1.1.0：通知 SpringBoard 侧重评 HUD 断言持有状态
 }
 
 + (BOOL)isDebugEnabled {
@@ -1007,36 +1005,27 @@ static void TapPointsDebounced(float delta) {
 }
 
 // =====================================================
-// v1.1.1：SpringBoard 侧 HUD 断言 + 跨进程 Darwin 通知（v1.1.0 的真机回归修复版）
+// v1.1.0 新增：SpringBoard 侧系统级音量键拦截 + 跨进程 Darwin 通知
 // 参考：Apple iOS 18.2 反编译源码（SBVolumeControl.m / AVSystemController.m）+
 //       SmartVolumeControl3 成熟模式。本项目纯 clang 无 theos/Logos，
 //       故用运行时方法交换（method_setImplementation）而非 %hook。
 //
-// v1.1.0 的教训（用户真机实测）：当时在钩子里「不调原实现」彻底吞键 → 音量数值不变 →
-// App 侧 KVO 永不触发 → 映射只能靠 Darwin 回传；该回传链在真机上一断，映射全死
-// （症状：只剩音量条隐藏，其他功能全无）。**映射的触发链从此只有 KVO 一条，
-// 且是 v1.0.x 真实验证过的那条。**
-//
-// v1.1.1 架构（一个 dylib，按进程 bundle id 自动分流）：
+// 架构（一个 dylib，按进程 bundle id 自动分流）：
 //   SpringBoard 进程（com.apple.springboard）：
-//     · 钩 SBVolumeControl.handleVolumeButtonWithType:down:（iOS 18.2 反编译实证），
-//       但**不再吞键**：先按「前台心跳 + 用户偏好」持有/撤销 Apple 官方 HUD 隐藏断言
-//       acquireVolumeHUDHiddenAssertionForReason:（旧系统没有该方法就静默跳过，
-//       继续用 App 侧 MPVolumeView 兜底），然后**原样调用原实现放行按键**
-//     · 放行 → 音量照常变化 → App 侧 KVO 照常触发映射（与 v1.0.x 完全同一条链）；
-//       断言保证音量条不弹。即：SpringBoard 注入只决定「音量条闪不闪」，
-//       永远不决定「映射灵不灵」
+//     · 钩 SBVolumeControl.handleVolumeButtonWithType:down:（102=音量+ / 103=音量-，
+//       反编译与 SVC3 双证）；目标 App 在前台时「吞掉」按键：不调原实现 →
+//       音量数值不变、音量 HUD 不出现、Apple 的连发链也不发生
+//       （长按连发由下面用「代数令牌」自建，保持 v1.0.16 手感）
+//     · 持有 Apple 官方 HUD 隐藏断言 acquireVolumeHUDHiddenAssertionForReason:
+//       （反编译实证；旧系统没有该方法就静默跳过，继续用 App 侧 MPVolumeView 兜底）
 //     · 电源+音量截屏走独立手势识别器（SBCombinationHardwareButton），
-//       与 SBVolumeControl 平行消费按键事件，本钩子不影响截屏（已核实）
+//       与 SBVolumeControl 平行消费按键事件，吞键不影响截屏（已核实）
 //   App 进程：v1.0.16 全部逻辑原样保留（KVO + 钉音量 + MPVolumeView 兜底），
-//     只**发**不**收** Darwin 通知：
+//     额外监听 Darwin 通知；收到即触发同一次点击/滑动
 //     · 前台心跳（beacon，约 2s 一次）/ 退后台（bye）：只有本 App 在前台时
-//       SpringBoard 才持断言；其余场景完全放行 = 系统原生行为
-//     · HUD 偏好变化（hud.on / hud.off）：编进通知名广播（Darwin 通知无 payload），
-//       避免依赖跨进程 NSUserDefaults suite 共享（现代 iOS 上不保证）
-// 兜底链：钩子装不上（iOS 没有该方法 / 没注入 SpringBoard / Darwin 广播被沙盒拦）→
-//         全部退化成 v1.0.16 行为：KVO 检测 + 钉回音量 + MPVolumeView 抑 HUD，
-//         映射始终可用，最差情况只是音量条短暂闪烁。
+//       SpringBoard 才吞键；其余场景音量键完全放行 = 系统原生行为
+// 兜底链：钩子装不上（iOS 没有该方法 / 没注入 SpringBoard）→ 菜单显示「未生效」，
+//         自动回到 v1.0.16 的 KVO 兼容模式，行为与旧版完全一致。
 // =====================================================
 
 // ---------- 进程角色判定 ----------
@@ -1064,14 +1053,13 @@ static BOOL              gSBHookInstalled     = NO;
 static id                gSBVolumeControl     = nil;   // SBVolumeControl 实例（懒捕获）
 static id                gSBHUDAssertion      = nil;   // Apple 官方 HUD 隐藏断言（强引用即生效）
 static CFAbsoluteTime    gBeaconAt            = 0;     // 最近一次前台心跳时间
-static BOOL              gSBHudPref           = YES;   // 用户「隐藏音量条」偏好（App 广播同步，默认隐藏）
 
 static BOOL DVTBeaconActive(void) {
     if (gBeaconAt <= 0) return NO;
     return (CFAbsoluteTimeGetCurrent() - gBeaconAt) < 5.0;   // 5s 收不到心跳视为已退前台
 }
 
-// 把钩子状态写进共享 suite，供 App 侧菜单显示「系统级音量条抑制：已生效/未生效」（仅提示用）
+// 把钩子状态写进共享 suite，供 App 侧菜单显示「系统级拦截：已生效/未生效」
 static void DVTSBWriteHookStatus(BOOL on) {
     @try {
         NSUserDefaults *d = Defaults();
@@ -1099,7 +1087,7 @@ static id DVTSBVolumeControl(void) {
 static void DVTSBEnsureHUDAssertion(void) {
     if (!gSBHookInstalled) return;
     if (gSBHUDAssertion) return;
-    if (!gSBHudPref) return;                       // 用户选择显示音量条 → 不持断言
+    if (!VolumeHudHidden()) return;                 // 用户选择显示音量条 → 不持断言
     id vc = DVTSBVolumeControl();
     if (!vc) return;
     @try {
@@ -1122,30 +1110,66 @@ static void DVTSBReleaseHUDAssertion(void) {
     // 没有 invalidate 的对象（BSInvalidatable 语义）：丢掉强引用即自动撤销
 }
 
-// 断言持有状态 = 前台心跳有效 且 用户偏好隐藏音量条
+// 断言持有状态 = 前台心跳有效 且 用户设置隐藏音量条
 static void DVTSBEvaluateAssertion(void) {
-    if (DVTBeaconActive() && gSBHudPref) DVTSBEnsureHUDAssertion();
+    if (DVTBeaconActive() && VolumeHudHidden()) DVTSBEnsureHUDAssertion();
     else DVTSBReleaseHUDAssertion();
+}
+
+// 清掉任何挂起的 Apple 连发（我们自己连发，不依赖 Apple 的 performSelector 链）
+static void DVTSBCancelVolumeEvent(id vc) {
+    @try {
+        SEL sel = NSSelectorFromString(@"cancelVolumeEvent");
+        if (vc && [vc respondsToSelector:sel]) [vc performSelector:sel];
+    } @catch (NSException *e) {}
+}
+
+static void DVTSBPostButton(BOOL isPlus) {
+    DVTDarwinPost(isPlus ? DVT_N_PLUS : DVT_N_MINUS);
+}
+
+// 长按连发：吞掉原实现后 Apple 的连发不会发生，用「代数令牌」自建连发链
+// （按下 gen++ 起链，松开 gen++ 全部待执行块自然失效，无需管理 timer 生命周期）
+static NSInteger gSBRepeatGen = 0;
+static NSInteger gSBRepeatCount = 0;
+static void DVTSBScheduleRepeat(BOOL isPlus, NSInteger gen) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.30 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (gen != gSBRepeatGen) return;
+        DVTSBPostButton(isPlus);
+        if (++gSBRepeatCount > 120) return;    // 硬上限约 36s，防失控
+        DVTSBScheduleRepeat(isPlus, gen);
+    });
 }
 
 // 钩子实现：替换 SBVolumeControl.handleVolumeButtonWithType:down:
 // 注意：iOS SDK 的 IMP 默认是 void(*)(void) 零参数签名（见 objc.h 的 OBJC_OLD_DISPATCH_PROTOTYPES），
 // 调原实现必须显式转型成匹配的函数指针类型，否则编译报 "expected 0, have 4"。
-//
-// v1.1.1：本钩子**不吞键**。职责只有一件事：按键到来时按「前台心跳 + 用户偏好」
-// 持有/撤销 Apple 官方 HUD 断言，然后原样放行原实现。音量照常变化 → App 侧 KVO
-// 照常触发映射（v1.0.x 真实验证过的唯一触发链）；断言只保证音量条不弹。
-// v1.1.0 曾在这里吞键（不调 orig），音量不变 → KVO 不触发 → 映射只能靠 Darwin
-// 回传，真机上一断就全死。教训：SpringBoard 侧永远不决定映射灵不灵。
 typedef void (*DVTVolumeButtonFn)(id, SEL, int64_t, BOOL);
 static void DVTSBVolumeButton(id self, SEL _cmd, int64_t type, BOOL down) {
     IMP orig = gOrigVolumeButtonIMP;
     if (!orig) return;                                  // 理论上不会发生（装不上就不会被调用）
+    BOOL isVolume = (type == 102 || type == 103);       // 102=音量+ 103=音量-（反编译+SVC3 双证）
+    if (!isVolume || !DVTBeaconActive()) {
+        // 非音量键，或目标 App 不在前台 → 完全放行：系统原生行为（音量照变、HUD 照出）
+        DVTSBEvaluateAssertion();                       // 顺带纠正断言持有状态
+        ((DVTVolumeButtonFn)orig)(self, _cmd, type, down);
+        return;
+    }
     if (gSBVolumeControl != self) gSBVolumeControl = self;   // 顺手捕获实例
-    // 前台心跳有效且用户要隐藏音量条 → 持断言（音量条不弹）；否则撤销（系统原生音量条）
-    DVTSBEvaluateAssertion();
-    // 原样放行：系统照常改音量、照常走 Apple 自己的连发链；App 侧 KVO 照常触发映射
-    ((DVTVolumeButtonFn)orig)(self, _cmd, type, down);
+    BOOL isPlus = (type == 102);
+    if (down) {
+        DVTSBCancelVolumeEvent(self);
+        DVTSBEnsureHUDAssertion();
+        DVTSBPostButton(isPlus);
+        gSBRepeatGen++;
+        gSBRepeatCount = 0;
+        DVTSBScheduleRepeat(isPlus, gSBRepeatGen);
+    } else {
+        gSBRepeatGen++;                                 // 停连发
+        DVTSBCancelVolumeEvent(self);
+    }
+    // 关键：不调用 orig → 音量数值不变、HUD 不弹、Apple 连发链不发生
 }
 
 static void DVTSBInstallHook(int attempt) {
@@ -1177,12 +1201,8 @@ static void DVTSBDarwinCB(CFNotificationCenterRef center, void *observer, CFStri
     } else if (CFEqual(name, CFSTR(DVT_N_BYE))) {
         gBeaconAt = 0;
         DVTSBReleaseHUDAssertion();
-    } else if (CFEqual(name, CFSTR(DVT_N_HUD_ON))) {
-        gSBHudPref = YES;
+    } else if (CFEqual(name, CFSTR(DVT_N_SETTINGS))) {
         DVTSBEvaluateAssertion();
-    } else if (CFEqual(name, CFSTR(DVT_N_HUD_OFF))) {
-        gSBHudPref = NO;
-        DVTSBReleaseHUDAssertion();
     }
 }
 
@@ -1192,9 +1212,7 @@ static void DVTInstallSpringBoardSide(void) {
                                     CFNotificationSuspensionBehaviorDeliverImmediately);
     CFNotificationCenterAddObserver(c, NULL, DVTSBDarwinCB, CFSTR(DVT_N_BYE), NULL,
                                     CFNotificationSuspensionBehaviorDeliverImmediately);
-    CFNotificationCenterAddObserver(c, NULL, DVTSBDarwinCB, CFSTR(DVT_N_HUD_ON), NULL,
-                                    CFNotificationSuspensionBehaviorDeliverImmediately);
-    CFNotificationCenterAddObserver(c, NULL, DVTSBDarwinCB, CFSTR(DVT_N_HUD_OFF), NULL,
+    CFNotificationCenterAddObserver(c, NULL, DVTSBDarwinCB, CFSTR(DVT_N_SETTINGS), NULL,
                                     CFNotificationSuspensionBehaviorDeliverImmediately);
     DVTSBInstallHook(0);
     // 1s 看门狗：心跳过期（App 崩溃/被杀）时自动撤掉 HUD 断言，恢复系统原生音量条
@@ -1211,10 +1229,20 @@ static void DVTInstallSpringBoardSide(void) {
 }
 
 // =====================================================
-// App 侧：只发不收（v1.1.1）——前台心跳 + HUD 偏好广播。
-// 不监听任何 Darwin 回传：映射唯一触发链是 KVO（v1.0.x 真实验证过），
-// SpringBoard 注入失败 / 回传断 / 广播被沙盒拦，映射都照常工作。
+// App 侧：接收 SpringBoard 广播 + 前台心跳
 // =====================================================
+static void DVTDarwinCB(CFNotificationCenterRef center, void *observer, CFStringRef name,
+                        const void *object, CFDictionaryRef userInfo) {
+    BOOL isPlus = CFEqual(name, CFSTR(DVT_N_PLUS));
+    if (!isPlus && !CFEqual(name, CFSTR(DVT_N_MINUS))) return;
+    // 与 v1.0.16 语义一致：只有本 App 在前台时才动作（兜底防竞态）
+    if ([[UIApplication sharedApplication] applicationState] != UIApplicationStateActive) return;
+    // Darwin 回调线程不确定，统一切主队列（fakeTouch 本来就要求主线程）
+    dispatch_async(dispatch_get_main_queue(), ^{
+        TapPointsDebounced(isPlus ? 0.05f : -0.05f);
+    });
+}
+
 static dispatch_source_t gBeaconTimer = NULL;
 static void DVTStartBeaconHeartbeat(void) {
     if (gBeaconTimer) return;
@@ -1243,24 +1271,22 @@ static void DVTStopBeaconHeartbeat(void) {
     [nc addObserver:self selector:@selector(dvtInactive) name:UIApplicationWillResignActiveNotification object:nil];
     [nc addObserver:self selector:@selector(dvtBackground) name:UIApplicationDidEnterBackgroundNotification object:nil];
     DVTStartBeaconHeartbeat();
-    [self dvtAnnounceHudPref];   // v1.1.1：向 SpringBoard 同步「隐藏音量条」偏好
     if ([[UIApplication sharedApplication] applicationState] == UIApplicationStateActive) {
         DVTDarwinPost(DVT_N_BEACON);       // 注入时可能已在前台：立即广播一次
     }
 }
-// v1.1.1：偏好值编进通知名（Darwin 通知无 payload），不依赖跨进程 suite 共享
-- (void)dvtAnnounceHudPref {
-    DVTDarwinPost(VolumeHudHidden() ? DVT_N_HUD_ON : DVT_N_HUD_OFF);
-}
-- (void)dvtActive     { DVTStartBeaconHeartbeat(); DVTDarwinPost(DVT_N_BEACON); [self dvtAnnounceHudPref]; }
+- (void)dvtActive     { DVTStartBeaconHeartbeat(); DVTDarwinPost(DVT_N_BEACON); }
 - (void)dvtInactive   { DVTDarwinPost(DVT_N_BYE); }
 - (void)dvtBackground { DVTDarwinPost(DVT_N_BYE); DVTStopBeaconHeartbeat(); }
 @end
 static DVTAppBeacon *gAppBeacon = nil;
 
 static void DVTInstallAppSide(void) {
-    // v1.1.1：App 侧只广播（心跳 + HUD 偏好），不监听任何回传。
-    // 映射唯一触发链是 KVO——SpringBoard 注入成败只影响音量条是否闪烁。
+    CFNotificationCenterRef c = CFNotificationCenterGetDarwinNotifyCenter();
+    CFNotificationCenterAddObserver(c, NULL, DVTDarwinCB, CFSTR(DVT_N_PLUS), NULL,
+                                    CFNotificationSuspensionBehaviorDeliverImmediately);
+    CFNotificationCenterAddObserver(c, NULL, DVTDarwinCB, CFSTR(DVT_N_MINUS), NULL,
+                                    CFNotificationSuspensionBehaviorDeliverImmediately);
     if ([UIApplication sharedApplication]) {
         gAppBeacon = [DVTAppBeacon new];
         [gAppBeacon start];
@@ -1405,14 +1431,14 @@ static void DirectTapInit(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         if (DVTIsSpringBoardProcess()) {
-            // v1.1.1：SpringBoard 进程只装 HUD 断言钩子，不初始化任何 App 侧 UI / 音频会话
+            // v1.1.0：SpringBoard 进程只装系统级拦截，不初始化任何 App 侧 UI / 音频会话
             dispatch_async(dispatch_get_main_queue(), ^{
                 DVTInstallSpringBoardSide();
             });
             return;
         }
         dispatch_async(dispatch_get_main_queue(), ^{
-            DVTInstallAppSide();      // v1.1.1：广播前台心跳 + HUD 偏好（KVO 触发链不受影响）
+            DVTInstallAppSide();      // v1.1.0：监听 SpringBoard 广播 + 前台心跳（KVO 兜底不受影响）
             gObs = [DirectVolumeObserver new];
             [[AVAudioSession sharedInstance] addObserver:gObs
                                               forKeyPath:@"outputVolume"
