@@ -1,10 +1,10 @@
-// DirectVolumeTap v1.0.21 — 连滑重做 + 调试日志整体下线：
-//   ① 连滑同方向门控：起滑即锁方向；回放窗口期内反方向按键完全无视（不计数、不打断）；
-//      连滑中按反方向 = 立即断连滑（当前滑收尾即停）；连滑中按同方向 = 无动作。
-//   ② 连滑阈值 3 → 5（起滑计 1，第 4 次提示「再按一次进入连滑」，第 5 次进入）。
-//   ③ 新增「连滑」总开关：菜单内位于「点击设置」与「回放速率」之间，默认开；
-//      关闭后窗口期按压静默忽略；连滑中关闭则当前滑收尾后停。
-//   ④ 按用户要求彻底移除调试日志（LogDVT / Documents/DVT.log 全部删除，v1.0.9~1.0.17 曾删、v1.0.18~20 又恢复，本版不再有）。
+// DirectVolumeTap v1.0.22 — 连滑变速 + 反方向刹停 + 删除回放速率：
+//   ① 连滑中按同方向 = 升档加速：1→2→3→1 循环，对「下一段滑」生效，pill 提示（连滑一倍速/二倍速/三倍速）；
+//      档位不记忆，进连滑/刹停/退后台均复位 1 档。
+//   ② 回放中按反方向（任何状态）= 立即刹停：中断当前滑剩余帧、补发 touch 结束、销毁回放计时器；
+//      连滑中则同时断连滑 + 档位复位 + 弹「已退出连滑」；未连滑则静默刹停。
+//   ③ 删除「回放速率」slider（v1.0.4 起的功能）：调速统一由连滑 3 档接管，单次滑固定原速 1.0。
+//   ④ 保留安全网：单帧位移封顶屏宽 1/10，防止极端倍速下手势识别失败。
 // 音量机制不变：无静音循环保活（仅前台 setActive、退后台停用）+ 徘徊 1/16 + 前台闸 + 退后台清理连滑/回放。
 // 不依赖任何设置页/配置：把 dylib 注入哪个 App，就在哪个 App 生效。
 //   ① 三指长按 → 弹出「菜单」：
@@ -28,9 +28,8 @@
 static BOOL DebugEnabled(void);        // 轨迹可视化开关
 static BOOL SwipeBurstEnabled(void);   // v1.0.21：连滑总开关
 static UIWindow *FindKeyWindow(void);  // 定义见下方（showDebugMarkerAtPoint 复用）
-static float DVTGetRate(void);         // 前向声明，定义见下方（openVolumeSettings 中设置滑块初值会先用到）
 static void ApplyVolumeHudHidden(BOOL hidden);  // 前向声明，定义见下方（菜单开关与启动时调用）
-static void StartSwipeReplay(BOOL isPlus);       // 前向声明，定义见下方（dvtFinishSwipe 连滑续滑会先用到）
+static void StartSwipeReplay(BOOL isPlus, float rate);  // 前向声明，定义见下方（dvtFinishSwipe 连滑续滑会先用到；rate=回放倍速）
 
 // ---------- NSUserDefaults（独立 suite，不与 VolumeKeyTapper 混） ----------
 static NSUserDefaults *Defaults(void) {
@@ -187,7 +186,7 @@ static BOOL VolumeHudHidden(void) {
 
     // 菜单面板
     CGFloat pw = MIN(window.bounds.size.width - 40, 320);
-    CGFloat ph = 380;   // v1.0.21：新增「连滑」行，面板加高
+    CGFloat ph = 320;   // v1.0.22：「回放速率」行已删（v1.0.21 曾因「连滑」行加到 380），回到 5 行原高度
     UIView *panel = [[UIView alloc] initWithFrame:CGRectMake((window.bounds.size.width - pw)/2,
                                                              (window.bounds.size.height - ph)/2,
                                                              pw, ph)];
@@ -229,8 +228,8 @@ static BOOL VolumeHudHidden(void) {
     [modeBtn addTarget:self action:@selector(toggleVolumeMode) forControlEvents:UIControlEventTouchUpInside];
     [panel addSubview:modeBtn];
 
-    // 隐藏音量条开关行（打开=隐藏音量条，关闭=显示音量条，默认开=隐藏），位于【轨迹可视化】上方
-    UIView *hudRow = [[UIView alloc] initWithFrame:CGRectMake(16, 266, pw - 32, 46)];
+    // 隐藏音量条开关行（打开=隐藏音量条，关闭=显示音量条，默认开=隐藏），位于【连滑】下方
+    UIView *hudRow = [[UIView alloc] initWithFrame:CGRectMake(16, 210, pw - 32, 46)];
     hudRow.layer.cornerRadius = 10;
     hudRow.backgroundColor = [UIColor colorWithWhite:0.93 alpha:1];
     [panel addSubview:hudRow];
@@ -244,8 +243,8 @@ static BOOL VolumeHudHidden(void) {
     [hudSwitch addTarget:self action:@selector(onVolumeHudSwitchChanged:) forControlEvents:UIControlEventValueChanged];
     [hudRow addSubview:hudSwitch];
 
-    // 调试开关行（轨迹可视化）—— 顺序第 5 位
-    UIView *dbgRow = [[UIView alloc] initWithFrame:CGRectMake(16, 318, pw - 32, 46)];
+    // 调试开关行（轨迹可视化）—— 顺序第 5 位（v1.0.22：速率行删除后仍为第 5 位）
+    UIView *dbgRow = [[UIView alloc] initWithFrame:CGRectMake(16, 262, pw - 32, 46)];
     dbgRow.layer.cornerRadius = 10;
     dbgRow.backgroundColor = [UIColor colorWithWhite:0.93 alpha:1];
     [panel addSubview:dbgRow];
@@ -259,7 +258,8 @@ static BOOL VolumeHudHidden(void) {
     [self.debugSwitch addTarget:self action:@selector(onDebugSwitchChanged:) forControlEvents:UIControlEventValueChanged];
     [dbgRow addSubview:self.debugSwitch];
 
-    // v1.0.21：连滑总开关行（滑动模式连滑功能总闸，默认开），位于【点击设置】与【回放速率】之间
+    // v1.0.21：连滑总开关行（滑动模式连滑功能总闸，默认开），位于【点击设置】与【隐藏音量条】之间
+    // （v1.0.22：「回放速率」行已删——调速统一由连滑 3 档接管，菜单回到 5 行，面板高度收回 320）
     UIView *burstRow = [[UIView alloc] initWithFrame:CGRectMake(16, 158, pw - 32, 46)];
     burstRow.layer.cornerRadius = 10;
     burstRow.backgroundColor = [UIColor colorWithWhite:0.93 alpha:1];
@@ -273,30 +273,6 @@ static BOOL VolumeHudHidden(void) {
     burstSwitch.on = SwipeBurstEnabled();
     [burstSwitch addTarget:self action:@selector(onSwipeBurstSwitchChanged:) forControlEvents:UIControlEventValueChanged];
     [burstRow addSubview:burstSwitch];
-
-    // 回放速率行（滑动模式回放快慢 + 轨迹可视化同步），位于【连滑】与【隐藏音量条】之间
-    UIView *rateRow = [[UIView alloc] initWithFrame:CGRectMake(16, 214, pw - 32, 46)];
-    rateRow.layer.cornerRadius = 10;
-    rateRow.backgroundColor = [UIColor colorWithWhite:0.93 alpha:1];
-    [panel addSubview:rateRow];
-    UILabel *rateTitle = [[UILabel alloc] initWithFrame:CGRectMake(12, 0, 84, 46)];
-    rateTitle.text = @"回放速率";
-    rateTitle.textColor = [UIColor darkGrayColor];
-    rateTitle.font = [UIFont systemFontOfSize:16];
-    [rateRow addSubview:rateTitle];
-    UISlider *rateSlider = [[UISlider alloc] initWithFrame:CGRectMake(96, 8, (pw - 32) - 74 - 96 - 4, 30)];
-    rateSlider.minimumValue = 0.5f;
-    rateSlider.maximumValue = 2.0f;
-    rateSlider.value = DVTGetRate();
-    [rateSlider addTarget:self action:@selector(onRateChanged:) forControlEvents:UIControlEventValueChanged];
-    [rateRow addSubview:rateSlider];
-    UILabel *rateVal = [[UILabel alloc] initWithFrame:CGRectMake((pw - 32) - 74, 0, 62, 46)];
-    rateVal.textAlignment = NSTextAlignmentRight;
-    rateVal.textColor = [UIColor darkGrayColor];
-    rateVal.font = [UIFont systemFontOfSize:14];
-    rateVal.text = [NSString stringWithFormat:@"x%.1f", DVTGetRate()];
-    rateVal.tag = 9911;   // 供 onRateChanged 实时更新
-    [rateRow addSubview:rateVal];
 
     // 当前模式入口：点击模式 / 滑动模式 二选一，点进入对应设置 —— 顺序第 2 位
     UIButton *modeEntry = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -527,14 +503,7 @@ static BOOL VolumeHudHidden(void) {
     [self showMenuInWindow:[UIApplication sharedApplication].keyWindow];
 }
 
-// v1.0.5：回放速率变更（影响回放快慢 + 轨迹可视化同步）
-- (void)onRateChanged:(UISlider *)s {
-    float r = s.value;
-    [Defaults() setObject:@(r) forKey:@"swipeRate"];
-    [Defaults() synchronize];
-    UILabel *lbl = (UILabel *)[s.superview viewWithTag:9911];
-    if (lbl) lbl.text = [NSString stringWithFormat:@"x%.1f", r];
-}
+// v1.0.22：原「回放速率」设置行（v1.0.4 起）已整体删除——调速统一由连滑 3 档接管
 
 - (void)saveSwipes {
     NSUserDefaults *d = Defaults();
@@ -824,20 +793,22 @@ static NSArray *LoadSwipePts(NSString *key) {
 
 // v1.0.4：滑动回放改用 CADisplayLink 驱动——对齐屏幕刷新率（VSync），
 // 每帧按【真实经过时间】插值出当前触摸坐标并注入一次 Moved，彻底消除 dispatch_after 抖动导致的卡顿。
-// 回放时长 = 录制时长（1:1 还原真实手指的流畅感）。
+// 回放时长 = 录制时长 / rate（v1.0.22 起 rate = 档位：单滑固定 1.0，连滑 1/2/3 档）。
 static BOOL gSwipeRunning = NO;   // 防狂按：回放进行中
 
-// ===== v1.0.17：滑动连滑（连按触发，仅滑动模式）；v1.0.21 重做：同方向门控 =====
+// ===== v1.0.17：滑动连滑（连按触发，仅滑动模式）；v1.0.21 重做：同方向门控；v1.0.22：变速 + 刹停 =====
 // 复用「滑动回放期间」当检测窗口：回放中每来一次同方向有效按压就累计一次，连按达阈值即进入连滑；
 // 连滑 = 每次滑动收尾后无缝续同一方向滑动（无间隔重复）。
-// v1.0.21 起（修复「按反方向也能连滑」的 bug）：
-//   · 起滑即锁方向（gSwipeBurstPlus 起滑时定，连滑方向只能是起滑方向）；
-//   · 窗口期内反方向按键 = 完全无视（不计数、不打断、不起滑）；
-//   · 连滑中按同方向 = 无动作；连滑中按反方向 = 立即断连滑（当前滑收尾即停）；
-//   · 总开关（菜单「连滑」）关闭时：窗口期按压静默忽略；连滑中关闭则当前滑收尾后停。
+// 方向门控（v1.0.21）：起滑即锁方向（gSwipeBurstPlus 起滑时定，连滑方向只能是起滑方向）；
+//   窗口期内反方向按键 = 不再是无视（v1.0.22 改为刹停，见 TapPoints）。
+// 变速（v1.0.22）：连滑中按同方向 = 升档 1→2→3→1 循环，对下一段滑生效；档位不记忆。
+// 刹停（v1.0.22）：回放中按反方向（任何状态）= 立即中断当前滑剩余帧。
+// 总开关（菜单「连滑」）关闭时：窗口期按压静默忽略；连滑中关闭则当前滑收尾后停。
 static NSInteger gSwipeBurstCount  = 0;    // 当前窗口内同方向累计按压次数（含起滑那一次）
 static BOOL      gSwipeBurstActive = NO;   // 是否连滑中
 static BOOL      gSwipeBurstPlus   = YES;  // 连滑方向（YES=音量+，NO=音量-），起滑时锁定
+static NSInteger gSwipeBurstRate   = 1;    // v1.0.22：连滑倍速档位 1/2/3（effectiveRate = 档位，不记忆）
+static BOOL      gSwipeStopRequested = NO;// v1.0.22：刹停请求（KVO 线程置位，DVTFakeSwipe 每帧检查）
 static const NSInteger kSwipeBurstThreshold = 5;  // 同方向连按几次触发连滑（v1.0.21：3→5）
 
 @interface DVTSwipeTickProxy : NSObject
@@ -856,26 +827,26 @@ static BOOL              gSwipeEnded = NO;    // 是否已注入 Ended（防重�
 static BOOL              gSwipeFinished = NO; // 是否已收尾（防重复收尾）
 static dispatch_block_t  gSwipeWatchdog = nil;
 
-// 回放速率（影响快慢，轨迹可视化同步），默认 1.0，范围 0.5~2.0
-static float DVTGetRate(void) {
-    float r = [[Defaults() objectForKey:@"swipeRate"] floatValue];
-    if (r < 0.5f || r > 2.0f) r = 1.0f;
-    return r;
-}
+// v1.0.22：删除「回放速率」slider（v1.0.4 起的功能）——调速统一由连滑 3 档接管，
+// 单次滑与连滑外滑固定原速 1.0，连滑续滑按当前档位 gSwipeBurstRate。
 
 // 回放收尾：只执行一次，成对清理 link / proxy / watchdog / 防狂按标志，绝不卡死
 static void dvtFinishSwipe(void) {
     if (gSwipeFinished) return;
     gSwipeFinished = YES;
+    BOOL stopReq = gSwipeStopRequested;   // v1.0.22：刹停收尾标志先存后清
+    gSwipeStopRequested = NO;
     if (gSwipeLink) { [gSwipeLink invalidate]; gSwipeLink = nil; }
     gSwipeProxy = nil;
     if (gSwipeWatchdog) { dispatch_block_cancel(gSwipeWatchdog); gSwipeWatchdog = nil; }
     gSwipeRunning = NO;
     // v1.0.17 连滑：本段收尾后无缝续同一方向滑动（无间隔重复触发映射滑动）。
     // v1.0.21：总开关关闭 → 当前滑收尾后即停（不续滑），并清理连滑状态。
+    // v1.0.22：续滑按当前倍速档位；刹停（stopReq）收尾时强制断连滑——
+    //   反方向刹停分支虽已置 active=NO，这里再兜一次，防止半帧内同方向又凑满计数的极端竞态。
     if (gSwipeBurstActive) {
-        if (SwipeBurstEnabled()) {
-            StartSwipeReplay(gSwipeBurstPlus);
+        if (SwipeBurstEnabled() && !stopReq) {
+            StartSwipeReplay(gSwipeBurstPlus, (float)gSwipeBurstRate);
         } else {
             gSwipeBurstActive = NO;
             gSwipeBurstCount  = 0;
@@ -902,7 +873,10 @@ static CGPoint DVTSwipeInterp(NSArray *xs, NSArray *ys, NSArray *ts, double targ
     return CGPointMake(fa + (fb - fa) * f, ga + (gb - ga) * f);
 }
 
-static void DVTFakeSwipe(NSArray *pts, BOOL isPlus) {
+// v1.0.22：rate 由参数传入（单次滑/连滑外滑固定 1.0；连滑续滑按档位 1/2/3）；
+//   每帧检查 gSwipeStopRequested（反方向刹停），命中即补发 Ended 并收尾；
+//   新增单帧位移封顶（屏宽 1/10）——极端倍速下也不会一帧跳太远导致 iOS 手势识别失败。
+static void DVTFakeSwipe(NSArray *pts, BOOL isPlus, float rate) {
     if (!pts || [pts count] < 2) { gSwipeRunning = NO; return; }
     // 预解析 [x,y,t]，避免每帧反复解包
     NSMutableArray *xs = [NSMutableArray array], *ys = [NSMutableArray array], *ts = [NSMutableArray array];
@@ -918,8 +892,9 @@ static void DVTFakeSwipe(NSArray *pts, BOOL isPlus) {
     double t0 = [ts[0] doubleValue];
     double totalMs = [ts[m-1] doubleValue] - t0;
     if (totalMs <= 0) totalMs = 1.0;
-    float rate = DVTGetRate();
-    double effTotal = totalMs / rate;   // 速率>1 更快，<1 更慢
+    if (rate < 1.0f) rate = 1.0f;               // 档位最小 1，不减速
+    double effTotal = totalMs / rate;           // 倍率>1 更快
+    CGFloat maxStep = [UIScreen mainScreen].bounds.size.width / 10.0;  // 单帧位移封顶（安全网）
 
     // 初始化回放上下文
     gSwipePid = -1;
@@ -928,17 +903,36 @@ static void DVTFakeSwipe(NSArray *pts, BOOL isPlus) {
     gSwipeRunning = YES;
     gSwipeProxy = [[DVTSwipeTickProxy alloc] init];
     __block CFAbsoluteTime startT = CFAbsoluteTimeGetCurrent();
+    __block CGPoint lastPt = CGPointMake([xs[0] doubleValue], [ys[0] doubleValue]);
     gSwipeLink = [CADisplayLink displayLinkWithTarget:gSwipeProxy selector:@selector(onTick:)];
     [gSwipeLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
 
     if ([AutoSkipSettingsCenter isDebugEnabled]) {
-        [AutoSkipSettingsCenter dvtBeginTrail:isPlus firstPoint:CGPointMake([xs[0] doubleValue], [ys[0] doubleValue])];
+        [AutoSkipSettingsCenter dvtBeginTrail:isPlus firstPoint:lastPt];
     }
 
     gSwipeProxy.tick = ^{
+        // v1.0.22 刹停：反方向按键置位，下一帧即中断（补发 Ended 在当前坐标后收尾）
+        if (gSwipeStopRequested) {
+            if (gSwipePid >= 0 && !gSwipeEnded) {
+                [PTFakeMetaTouch fakeTouchId:gSwipePid AtPoint:lastPt withTouchPhase:UITouchPhaseEnded];
+                gSwipeEnded = YES;
+            }
+            if ([AutoSkipSettingsCenter isDebugEnabled]) [AutoSkipSettingsCenter dvtEndTrail];
+            dvtFinishSwipe();
+            return;
+        }
         double elapsedMs = (CFAbsoluteTimeGetCurrent() - startT) * 1000.0;
-        double targetT = t0 + elapsedMs * rate;   // 按速率推进插值时间
+        double targetT = t0 + elapsedMs * rate;   // 按倍速推进插值时间
         CGPoint cur = DVTSwipeInterp(xs, ys, ts, targetT);
+        // 单帧位移封顶：超出 maxStep 则沿推进方向截断（封顶期间匀速爬行，末帧直接到终点，不卡死）
+        CGFloat dx = cur.x - lastPt.x, dy = cur.y - lastPt.y;
+        CGFloat dist = (CGFloat)sqrt((double)(dx*dx + dy*dy));
+        if (dist > maxStep && dist > 0.001) {
+            CGFloat k = maxStep / dist;
+            cur = CGPointMake(lastPt.x + dx * k, lastPt.y + dy * k);
+        }
+        lastPt = cur;
         if (gSwipePid < 0) gSwipePid = [PTFakeMetaTouch fakeTouchId:1 AtPoint:cur withTouchPhase:UITouchPhaseBegan];
         else               [PTFakeMetaTouch fakeTouchId:gSwipePid AtPoint:cur withTouchPhase:UITouchPhaseMoved];
         if ([AutoSkipSettingsCenter isDebugEnabled]) [AutoSkipSettingsCenter dvtExtendTrailTo:cur isPlus:isPlus];
@@ -974,9 +968,9 @@ static void DVTFakeSwipe(NSArray *pts, BOOL isPlus) {
                    dispatch_get_main_queue(), wdog);
 }
 
-// v1.0.17：起一段滑动回放（普通起滑与连滑续滑共用）。
+// v1.0.17：起一段滑动回放（普通起滑与连滑续滑共用；v1.0.22 起 rate 由调用方传入）。
 // 读不到轨迹则提示并退出连滑；否则立即标记回放中，再切主队列由 DVTFakeSwipe 逐帧回放。
-static void StartSwipeReplay(BOOL isPlus) {
+static void StartSwipeReplay(BOOL isPlus, float rate) {
     NSArray *pts = isPlus ? LoadSwipePts(@"swipePlus") : LoadSwipePts(@"swipeMinus");
     if (pts.count < 2) {
         ShowToast([NSString stringWithFormat:@"滑动模式未录制%@轨迹", isPlus ? @"音量+" : @"音量-"]);
@@ -985,7 +979,7 @@ static void StartSwipeReplay(BOOL isPlus) {
     }
     gSwipeRunning = YES;   // 立即标记回放中（异步块执行前也能拦截重复触发 / 供连滑判定）
     // fakeTouchId 必须主线程：切主队列，由 DVTFakeSwipe 内部 CADisplayLink(main) 逐帧回放
-    dispatch_async(dispatch_get_main_queue(), ^{ DVTFakeSwipe(pts, isPlus); });
+    dispatch_async(dispatch_get_main_queue(), ^{ DVTFakeSwipe(pts, isPlus, rate); });
 }
 
 // 按方向点击/滑动：delta>0 音量+，delta<0 音量-
@@ -994,19 +988,25 @@ static void TapPoints(float delta) {
     // v1.0.1：滑动模式 → 按录制轨迹完美回放
     if ([[Defaults() objectForKey:@"mode"] isEqualToString:@"swipe"]) {
         if (gSwipeRunning) {   // 回放中（= 连按检测窗口）
-            if (gSwipeBurstActive) {
-                // v1.0.21 同方向门控②：连滑中按反方向 = 立即断连滑（当前滑收尾后不再续）
-                if (isPlus != gSwipeBurstPlus) {
-                    gSwipeBurstActive = NO;
-                    gSwipeBurstCount  = 0;
-                    [AutoSkipSettingsCenter showPill:@"已退出连滑"];
-                    return;
-                }
-                return;   // 连滑中按同方向 = 无动作
+            if (isPlus != gSwipeBurstPlus) {
+                // v1.0.22 刹停：回放中按反方向（任何状态）= 立即中断当前滑剩余帧。
+                // 连滑中则同时断连滑 + 档位复位 + 弹「已退出连滑」；未连滑静默刹停。
+                BOOL wasBurst = gSwipeBurstActive;
+                gSwipeBurstActive     = NO;
+                gSwipeBurstCount      = 0;
+                gSwipeBurstRate       = 1;
+                gSwipeStopRequested   = YES;   // 通知 DVTFakeSwipe 下一帧中断（补发 Ended 后收尾）
+                if (wasBurst) [AutoSkipSettingsCenter showPill:@"已退出连滑"];
+                return;
             }
-            // 同方向门控①：未连滑的窗口期内，反方向按键完全无视（不计数、不打断、不起滑）。
-            // 这是「按 + 也能连滑」bug 的根治——连滑方向只能是起滑方向。
-            if (isPlus != gSwipeBurstPlus) return;
+            if (gSwipeBurstActive) {
+                // v1.0.22 变速：连滑中按同方向 = 升档 1→2→3→1 循环，对下一段滑生效
+                gSwipeBurstRate = (gSwipeBurstRate >= 3) ? 1 : gSwipeBurstRate + 1;
+                if      (gSwipeBurstRate == 1) [AutoSkipSettingsCenter showPill:@"连滑一倍速"];
+                else if (gSwipeBurstRate == 2) [AutoSkipSettingsCenter showPill:@"连滑二倍速"];
+                else                            [AutoSkipSettingsCenter showPill:@"连滑三倍速"];
+                return;
+            }
             if (!SwipeBurstEnabled()) return;   // 总开关关闭：窗口期按压静默忽略
             // v1.0.21 普通窗口期：同方向累计，达阈值即进入连滑
             gSwipeBurstCount++;
@@ -1014,14 +1014,17 @@ static void TapPoints(float delta) {
                 [AutoSkipSettingsCenter showPill:@"再按一次进入连滑"];
             } else if (gSwipeBurstCount >= kSwipeBurstThreshold) {
                 gSwipeBurstActive = YES;   // 方向 = gSwipeBurstPlus（起滑时已锁定）
+                gSwipeBurstRate   = 1;    // v1.0.22：进连滑从 1 档起
                 [AutoSkipSettingsCenter showPill:@"已进入连滑"];
             }
             return;
         }
         // 不在回放中：起新滑，开启新的检测窗口（本次按压计为第 1 次，并锁定方向）
+        // v1.0.22：单次滑固定原速 1.0（回放速率 slider 已删，调速只走连滑 3 档）
         gSwipeBurstCount = SwipeBurstEnabled() ? 1 : 0;
         gSwipeBurstPlus  = isPlus;
-        StartSwipeReplay(isPlus);
+        gSwipeBurstRate  = 1;
+        StartSwipeReplay(isPlus, 1.0f);
         return;
     }
     // 点击模式（原逻辑不变）
@@ -1191,8 +1194,10 @@ static void DVTDeactivateAudioSession(void) {
 //          + 停掉连滑/回放并清理触摸，回前台状态干净
 - (void)dvtAppDidEnterBackground {
     DVTDeactivateAudioSession();
-    gSwipeBurstActive = NO;
-    gSwipeBurstCount  = 0;
+    gSwipeBurstActive     = NO;
+    gSwipeBurstCount      = 0;
+    gSwipeBurstRate       = 1;    // v1.0.22：档位复位（不记忆）
+    gSwipeStopRequested   = NO;
     if (gSwipeRunning) {
         if (gSwipeLink) { [gSwipeLink invalidate]; gSwipeLink = nil; }
         gSwipeProxy = nil;
